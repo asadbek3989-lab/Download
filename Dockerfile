@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim
+FROM node:20-bookworm-slim
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates \
@@ -15,11 +15,8 @@ COPY package.json ./
 RUN npm install --omit=dev
 COPY src ./src
 
-ENV NODE_ENV=production \
-    NODE_NO_WARNINGS=1 \
-    DATA_DIR=/data
-RUN mkdir -p /data
-# Baza va cookies shu yerda saqlanadi. Railway'da /data ga VOLUME ulang.
-VOLUME ["/data"]
-
+ENV NODE_ENV=production
+# Baza shu papkada saqlanadi. Railway'da shu yo'lga Volume ulang (README ga qarang)
+ENV DATA_DIR=/app/data
+# Har ishga tushganda yt-dlp'ni yangilab oladi (YouTube tez-tez o'zgaradi)
 CMD ["sh", "-c", "yt-dlp -U || true; node src/index.js"]

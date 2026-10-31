@@ -4,12 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import { LANGS, CHOOSE_LANG, getT } from "./i18n.js";
-import * as DB from "./db.js";
+import * as S from "./store.js";
 import { getInfo, download, TooBigError, setupCookies } from "./ytdlp.js";
-import { parseLink, fmtDur, fetchImage, clip } from "./utils.js";
-import { buildCaption, getStartMsg } from "./content.js";
-import { rt, spawnTask } from "./state.js";
 import { registerAdmin } from "./admin.js";
+import {
+  buildCaption, plainCaption, shareKb, startMessage, sendStored,
+} from "./messages.js";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -18,315 +18,445 @@ if (!token) {
 }
 
 const MAX_PARALLEL = Number(process.env.MAX_PARALLEL || 2);
+const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 90);
+
+process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
+
 setupCookies();
+const bot = new Bot(token);
 
-const bot = new Bot(
-  token,
-  process.env.TG_API_ROOT ? { client: { apiRoot: process.env.TG_API_ROOT } } : undefined
-);
+// ---------- yordamchilar ----------
+const ALLOWED_HOSTS = [/(^|\.)youtube\.com$/, /^youtu\.be$/, /(^|\.)instagram\.com$/];
 
-const maxDurationMin = () => Number(DB.getSetting("max_duration_min", process.env.MAX_DURATION_MIN || 90));
-const dailyLimit = () => Number(DB.getSetting("daily_limit", 0));
+function extractUrl(text) {
+  const m = text.match(/https?:\/\/[^\s]+/i);
+  if (!m) return null;
+  try {
+    const u = new URL(m[0]);
+    if (ALLOWED_HOSTS.some((r) => r.test(u.hostname))) return u.toString();
+  } catch {}
+  return null;
+}
 
-// ---------- bir vaqtdagi yuklashlar navbati ----------
+const platformOf = (url) => (/instagram\.com/i.test(url) ? "instagram" : "youtube");
+
+function fmtDur(sec) {
+  if (!sec) return "—";
+  const s = Math.round(sec);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${ss}` : `${m}:${ss}`;
+}
+
+// Bir vaqtda ishlaydigan yuklashlar sonini cheklash
+let running = 0;
 const queue = [];
 const acquire = () =>
   new Promise((res) => {
-    if (rt.running < MAX_PARALLEL) { rt.running++; res(); }
-    else { rt.queued++; queue.push(res); }
+    if (running < MAX_PARALLEL) {
+      running++;
+      res();
+    } else queue.push(res);
   });
 const release = () => {
   const next = queue.shift();
-  if (next) { rt.queued--; next(); } else rt.running--;
+  if (next) next();
+  else running--;
 };
 
-// ---------- callback tugmalari uchun vaqtinchalik "ish"lar ----------
+// Callback tugmalari uchun ma'lumotlarni vaqtincha saqlash (64 bayt chegarasi bor)
 const jobs = new Map();
 setInterval(() => {
   const limit = Date.now() - 30 * 60 * 1000;
   for (const [id, j] of jobs) if (j.ts < limit) jobs.delete(id);
 }, 10 * 60 * 1000).unref();
 
-// ---------- umumiy middleware: kuzatuv, ban, texnik ishlar ----------
-bot.use(async (ctx, next) => {
-  if (ctx.myChatMember) return next();
-  const from = ctx.from;
-  if (!from || from.is_bot) return next();
-  const u = DB.upsertUser(from);
-  if (DB.isAdmin(from.id)) return next();
+const active = new Set(); // foydalanuvchi boshiga bitta faol yuklash
 
-  const t = getT(u.lang);
-  const deny = (text) => {
-    if (ctx.inlineQuery) return ctx.answerInlineQuery([]).catch(() => {});
-    if (ctx.callbackQuery) return ctx.answerCallbackQuery({ text, show_alert: true }).catch(() => {});
-    if (ctx.message) return ctx.reply(text).catch(() => {});
-  };
-  if (u.banned) return deny(t.banned);
-  if (DB.getSetting("maintenance") === "1") return deny(t.maintenance);
-  return next();
-});
+// Inline rejim (Ulashish tugmasi uchun) yoqilganmi
+let inlineOn = false;
+async function refreshInline() {
+  try {
+    const me = await bot.api.getMe();
+    inlineOn = !!me.supports_inline_queries;
+  } catch (e) {
+    console.error("getMe xato:", e.message);
+  }
+  return inlineOn;
+}
 
-bot.on("my_chat_member", (ctx) => {
-  if (ctx.chat.type !== "private") return;
-  const s = ctx.myChatMember.new_chat_member.status;
-  DB.setBlocked(ctx.from.id, s === "kicked" || s === "left");
-});
+const maxMinutes = () => S.settings.maxDurationMin ?? MAX_DURATION_MIN;
 
-registerAdmin(bot);
-
-// ---------- /start, /help, /lang ----------
 function askLang(ctx) {
   const kb = new InlineKeyboard();
   for (const [code, name] of Object.entries(LANGS)) kb.text(name, `lang:${code}`);
   return ctx.reply(CHOOSE_LANG, { reply_markup: kb });
 }
 
+// ---------- majburiy obuna ----------
+const subOkAt = new Map();
+async function missingChannels(api, uid) {
+  const { channels, subOn } = S.settings;
+  if (!subOn || !channels.length || S.isAdmin(uid)) return [];
+  if (Date.now() - (subOkAt.get(uid) || 0) < 60 * 1000) return [];
+  const missing = [];
+  for (const ch of channels) {
+    try {
+      const m = await api.getChatMember(ch.id, uid);
+      const ok =
+        ["creator", "administrator", "member"].includes(m.status) ||
+        (m.status === "restricted" && m.is_member);
+      if (!ok) missing.push(ch);
+    } catch (e) {
+      // Bot kanalda admin bo'lmasa tekshirib bo'lmaydi: foydalanuvchini to'smaymiz
+      console.error("obuna tekshirish xato:", ch.id, e.message);
+    }
+  }
+  if (!missing.length) subOkAt.set(uid, Date.now());
+  return missing;
+}
+
+function subKb(missing, t) {
+  const kb = new InlineKeyboard();
+  for (const ch of missing) kb.url(`📣 ${ch.title}`.slice(0, 60), ch.url).row();
+  return kb.text(t.subCheck, "sub:chk");
+}
+
+// ---------- kuzatuv / bloklash / texnik ishlar ----------
+bot.use(async (ctx, next) => {
+  if (ctx.chat?.type === "private" && ctx.from && (ctx.message || ctx.callbackQuery)) {
+    ctx.isNewUser = S.touchUser(ctx.from).isNew;
+    if (!S.isAdmin(ctx.from.id)) {
+      if (S.isBanned(ctx.from.id)) {
+        if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => {});
+        return;
+      }
+      if (S.settings.maintenance) {
+        const t = getT(S.getLang(ctx.from.id));
+        if (ctx.callbackQuery) return ctx.answerCallbackQuery({ text: t.maintenance, show_alert: true });
+        return ctx.reply(t.maintenance);
+      }
+    }
+  }
+  return next();
+});
+
+// ---------- admin panel ----------
+registerAdmin(bot, {
+  getRunning: () => running,
+  isInlineOn: () => inlineOn,
+  refreshInline,
+  defaultMaxMin: MAX_DURATION_MIN,
+});
+
+// ---------- foydalanuvchi buyruqlari ----------
+async function sendStart(ctx, lang) {
+  try {
+    await sendStored(ctx.api, ctx.chat.id, startMessage(lang), ctx.me.username);
+  } catch (e) {
+    console.error("start xabari xato:", e.message);
+    await ctx.reply(getT(lang).welcome);
+  }
+}
+
 bot.command("start", async (ctx) => {
-  const lang = DB.getLang(ctx.from.id);
+  const payload = String(ctx.match || "");
+  const ref = payload.match(/^r(\d+)$/);
+  if (ref && ctx.isNewUser) S.setReferrer(ctx.from.id, Number(ref[1]));
+  const lang = S.getLang(ctx.from.id);
   if (!lang) return askLang(ctx);
-  const c = getStartMsg(lang);
-  if (c) return ctx.reply(c.text, { entities: c.entities });
-  return ctx.reply(getT(lang).welcome);
+  await sendStart(ctx, lang);
 });
-bot.command("help", (ctx) => {
-  const lang = DB.getLang(ctx.from.id);
-  return lang ? ctx.reply(getT(lang).help) : askLang(ctx);
-});
+
 bot.command("lang", (ctx) => askLang(ctx));
+
+bot.command("help", async (ctx) => {
+  await ctx.reply(getT(S.getLang(ctx.from.id)).help);
+});
+
+bot.command("id", (ctx) => ctx.reply(`🆔 ${ctx.from.id}`));
+
+bot.command("me", async (ctx) => {
+  const u = S.getUser(ctx.from.id);
+  const t = getT(S.getLang(ctx.from.id));
+  await ctx.reply(t.me(u?.dl || 0, S.dailyUsed(ctx.from.id), u?.refs || 0));
+});
+
+bot.command("share", async (ctx) => {
+  const t = getT(S.getLang(ctx.from.id));
+  const link = `https://t.me/${ctx.me.username}?start=r${ctx.from.id}`;
+  const url = `https://t.me/share/url?url=${encodeURIComponent(link)}&text=${encodeURIComponent(t.shareText)}`;
+  await ctx.reply(t.shareBotMsg, { reply_markup: new InlineKeyboard().url(t.shareBotBtn, url) });
+});
 
 bot.callbackQuery(/^lang:(uz|ru|en)$/, async (ctx) => {
   const lang = ctx.match[1];
-  DB.setLang(ctx.from.id, lang);
-  await ctx.answerCallbackQuery().catch(() => {});
-  const c = getStartMsg(lang);
-  if (c) await ctx.editMessageText(c.text, { entities: c.entities }).catch(() => {});
-  else await ctx.editMessageText(getT(lang).welcome).catch(() => {});
-});
-
-// ---------- majburiy obuna (admin panelda yoqiladi) ----------
-async function isSubscribed(ctx) {
-  const channel = DB.getSetting("force_channel");
-  if (DB.getSetting("force_on") !== "1" || !channel || DB.isAdmin(ctx.from.id)) return true;
-  try {
-    const m = await ctx.api.getChatMember(channel, ctx.from.id);
-    return ["member", "administrator", "creator"].includes(m.status) || (m.status === "restricted" && m.is_member);
-  } catch (e) {
-    console.error("obuna tekshiruvi xatosi:", e.message);
-    return true; // bot kanalda admin bo'lmasa foydalanuvchilarni qulflab qo'ymaymiz
-  }
-}
-async function requireSub(ctx, t) {
-  if (await isSubscribed(ctx)) return true;
-  const ch = DB.getSetting("force_channel");
-  const kb = new InlineKeyboard().url(t.subBtn, `https://t.me/${ch.replace(/^@/, "")}`).row().text(t.checkBtn, "chk");
-  await ctx.api.sendMessage(ctx.chat.id, t.subscribe, { reply_markup: kb }).catch(() => {});
-  return false;
-}
-bot.callbackQuery("chk", async (ctx) => {
-  const t = getT(DB.getLang(ctx.from.id));
-  if (await isSubscribed(ctx)) {
-    await ctx.answerCallbackQuery().catch(() => {});
-    await ctx.editMessageText(t.subOk).catch(() => {});
+  const first = !S.getLang(ctx.from.id);
+  S.setLang(ctx.from.id, lang);
+  await ctx.answerCallbackQuery();
+  if (first) {
+    await ctx.deleteMessage().catch(() => {});
+    await sendStart(ctx, lang);
   } else {
-    await ctx.answerCallbackQuery({ text: t.notSub, show_alert: true }).catch(() => {});
+    await ctx.editMessageText(getT(lang).welcome).catch(() => {});
   }
 });
 
-// ---------- inline rejim: "Ulashish" ----------
-function inlineResult(s, botUsername) {
-  const reply_markup = { inline_keyboard: [[{ text: `📥 @${botUsername}`, url: `https://t.me/${botUsername}` }]] };
-  const base = { id: s.id, caption: s.caption, reply_markup };
-  if (s.kind === "audio") return { type: "audio", audio_file_id: s.file_id, ...base };
-  if (s.kind === "document") return { type: "document", document_file_id: s.file_id, title: s.title || "File", ...base };
-  return { type: "video", video_file_id: s.file_id, title: s.title || "Video", description: `@${botUsername}`, ...base };
-}
+bot.callbackQuery("sub:chk", async (ctx) => {
+  const t = getT(S.getLang(ctx.from.id));
+  subOkAt.delete(ctx.from.id);
+  const missing = await missingChannels(ctx.api, ctx.from.id);
+  if (missing.length) return ctx.answerCallbackQuery({ text: t.subNo, show_alert: true });
+  await ctx.answerCallbackQuery();
+  await ctx.editMessageText(t.subOk).catch(() => {});
+});
 
+// ---------- bot bloklangani/qayta yoqilgani ----------
+bot.on("my_chat_member", (ctx) => {
+  if (ctx.chat.type !== "private") return;
+  const st = ctx.myChatMember.new_chat_member.status;
+  S.markBlocked(ctx.from.id, st === "kicked" || st === "left");
+});
+
+// ---------- INLINE: «Ulashish» tugmasi ----------
 bot.on("inline_query", async (ctx) => {
-  const bu = ctx.me.username;
-  const q = ctx.inlineQuery.query.trim();
-  let rows = [];
-  const m = q.match(/^v([a-f0-9]{8})$/i);
-  if (m) {
-    const s = DB.getShare(m[1].toLowerCase());
-    if (s) rows = [s];
-  } else if (!q) {
-    rows = DB.recentShares(ctx.from.id, 10);
-  }
-  const results = rows.map((s) => inlineResult(s, bu));
-  if (!results.length) {
-    results.push({
-      type: "article",
-      id: "promo",
-      title: `📥 @${bu}`,
-      description: "YouTube / Instagram video & MP3",
-      input_message_content: { message_text: `📥 YouTube / Instagram → video & MP3\n👉 https://t.me/${bu}` },
-      reply_markup: { inline_keyboard: [[{ text: `📥 @${bu}`, url: `https://t.me/${bu}` }]] },
-    });
-  }
-  await ctx.answerInlineQuery(results, { cache_time: 0, is_personal: true }).catch((e) => console.error("inline:", e.message));
-});
+  try {
+    const uid = ctx.from.id;
+    const lang = S.getLang(uid) || "uz";
+    const t = getT(lang);
+    const q = ctx.inlineQuery.query.trim();
+    const botName = ctx.me.username;
 
-// BotFather'da /setinlinefeedback yoqilsa, ulashishlar soni hisoblanadi
-bot.on("chosen_inline_result", (ctx) => {
-  const id = ctx.chosenInlineResult.result_id;
-  if (id && id !== "promo") DB.bumpShare(id);
+    let items = [];
+    if (/^x[a-f0-9]{8}$/.test(q)) {
+      const s = S.getShare(q);
+      if (s) items = [[q, s]];
+    } else if (!q) {
+      items = S.recentShares(uid, 10);
+    }
+
+    const results = items.map(([id, s]) => {
+      const base = {
+        id,
+        caption: buildCaption(s.n, lang, botName) || undefined,
+        parse_mode: "HTML",
+        reply_markup: new InlineKeyboard().url(t.openBot, `https://t.me/${botName}?start=r${uid}`),
+      };
+      if (s.t === "audio") return { type: "audio", audio_file_id: s.f, ...base };
+      if (s.t === "document") return { type: "document", document_file_id: s.f, title: s.n || "File", ...base };
+      return { type: "video", video_file_id: s.f, title: s.n || "Video", ...base };
+    });
+
+    await ctx.answerInlineQuery(results, {
+      cache_time: 5,
+      is_personal: true,
+      ...(results.length ? {} : { button: { text: t.inlineBtn, start_parameter: "inline" } }),
+    });
+  } catch (e) {
+    console.error("inline xato:", e.message);
+  }
 });
 
 // ---------- havola qabul qilish ----------
 bot.on("message:text", (ctx) => {
-  if (ctx.chat.type !== "private") return;
-  const lang = DB.getLang(ctx.from.id);
-  if (!lang) return askLang(ctx);
-  spawnTask(() => processLink(ctx, lang));
+  // uzoq davom etadigan ish alohida ishlaydi, boshqa foydalanuvchilarni kutdirmaydi
+  handleLink(ctx).catch((e) => console.error("handleLink:", e.message));
 });
 
-async function processLink(ctx, lang) {
-  const t = getT(lang);
-  const link = parseLink(ctx.message.text);
-  if (!link) return void (await ctx.reply(t.invalid));
-  if (!(await requireSub(ctx, t))) return;
+async function fetchThumb(url) {
+  try {
+    const r = await fetch(url, {
+      signal: AbortSignal.timeout(10000),
+      headers: { "User-Agent": "Mozilla/5.0" },
+    });
+    if (!r.ok) return null;
+    const buf = Buffer.from(await r.arrayBuffer());
+    return buf.length > 500 && buf.length < 8 * 1024 * 1024 ? buf : null;
+  } catch {
+    return null;
+  }
+}
 
-  const chatId = ctx.chat.id;
+async function handleLink(ctx) {
+  const lang = S.getLang(ctx.from.id);
+  if (!lang) return askLang(ctx);
+  const t = getT(lang);
+
+  const url = extractUrl(ctx.message.text);
+  if (!url) return ctx.reply(t.invalid);
+
+  const missing = await missingChannels(ctx.api, ctx.from.id);
+  if (missing.length) return ctx.reply(t.subNeed, { reply_markup: subKb(missing, t) });
+
   const status = await ctx.reply(t.fetching);
-  const dropStatus = () => ctx.api.deleteMessage(chatId, status.message_id).catch(() => {});
+  const edit = (text, extra) =>
+    ctx.api.editMessageText(ctx.chat.id, status.message_id, text, extra).catch(() => {});
 
   try {
-    const info = await getInfo(link.url);
-    if (info.duration && info.duration > maxDurationMin() * 60) {
-      return void (await ctx.api.editMessageText(chatId, status.message_id, t.tooLong(maxDurationMin())).catch(() => {}));
+    const info = await getInfo(url);
+    if (info.duration && info.duration > maxMinutes() * 60) {
+      return edit(t.tooLong(maxMinutes()));
     }
 
     const id = crypto.randomBytes(4).toString("hex");
-    const job = {
-      url: link.url, key: link.key, platform: link.platform,
-      title: info.title, uploader: info.uploader, duration: info.duration,
-      chatId, msgId: null, hasPhoto: false, ts: Date.now(),
-    };
-    jobs.set(id, job);
+    jobs.set(id, {
+      url,
+      platform: platformOf(url),
+      key: info.key,
+      title: info.title,
+      uploader: info.uploader,
+      duration: info.duration,
+      ts: Date.now(),
+    });
 
     const kb = new InlineKeyboard();
     for (const o of info.options) kb.text(o.label || t.video, `dl:${id}:${o.q}`);
     kb.row().text(t.audio, `dl:${id}:mp3`);
-    const text = t.choose(clip(info.title, 200), fmtDur(info.duration), info.uploader);
 
-    // Muqova (cover) bilan birga ko'rsatamiz; olinmasa oddiy matn
-    const img = await fetchImage(info.thumbs);
-    let sent = null;
-    if (img) {
-      sent = await ctx.api
-        .sendPhoto(chatId, new InputFile(img.buf, `cover.${img.ext}`), { caption: clip(text, 1024), reply_markup: kb })
-        .catch((e) => { console.error("sendPhoto:", e.message); return null; });
-      if (sent) job.hasPhoto = true;
+    const text = t.choose(info.title, fmtDur(info.duration), (info.uploader || "").slice(0, 80));
+
+    // Videoning muqovasi bilan birga chiqaramiz
+    if (info.thumb) {
+      const buf = await fetchThumb(info.thumb);
+      const attempts = [];
+      if (buf) attempts.push(new InputFile(buf, "cover.jpg"));
+      attempts.push(info.thumb);
+      for (const photo of attempts) {
+        try {
+          await ctx.api.sendPhoto(ctx.chat.id, photo, { caption: text.slice(0, 1024), reply_markup: kb });
+          await ctx.api.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
+          return;
+        } catch (e) {
+          console.error("muqova yuborilmadi:", e.message);
+        }
+      }
     }
-    if (!sent) sent = await ctx.api.sendMessage(chatId, text, { reply_markup: kb });
-    job.msgId = sent.message_id;
-    await dropStatus();
+    await edit(text, { reply_markup: kb }); // muqova bo'lmasa — oddiy matn
   } catch (e) {
     console.error("getInfo xato:", e.message);
-    DB.logDownload({ userId: ctx.from.id, platform: link.platform, kind: "info", url: link.url, ok: false, error: e.message });
-    await ctx.api.editMessageText(chatId, status.message_id, t.failed).catch(() => {});
+    S.bump("err");
+    await edit(t.failed);
   }
 }
 
 // ---------- yuklab yuborish ----------
-const kindOf = (m) =>
-  m.video ? "video" : m.audio ? "audio" : "document";
-const fileIdOf = (m) =>
-  m.video?.file_id ?? m.audio?.file_id ?? m.document?.file_id ?? m.animation?.file_id ?? null;
-
-function sendMedia(api, chatId, kind, file, opts) {
-  if (kind === "audio") return api.sendAudio(chatId, file, opts);
-  if (kind === "document") return api.sendDocument(chatId, file, opts);
-  return api.sendVideo(chatId, file, opts);
-}
-
-function editCard(api, job, text) {
-  if (job.hasPhoto)
-    return api.editMessageCaption(job.chatId, job.msgId, { caption: clip(text, 1024) }).catch(() => {});
-  return api.editMessageText(job.chatId, job.msgId, text).catch(() => {});
-}
-
-bot.callbackQuery(/^dl:([a-f0-9]+):(\w+)$/, (ctx) => {
+bot.callbackQuery(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
   const [, id, q] = ctx.match;
-  spawnTask(() => processDownload(ctx, id, q));
-});
-
-async function processDownload(ctx, id, q) {
   const uid = ctx.from.id;
-  const t = getT(DB.getLang(uid));
-  const alert = (text) => ctx.answerCallbackQuery({ text, show_alert: true }).catch(() => {});
+  const lang = S.getLang(uid);
+  const t = getT(lang);
   const job = jobs.get(id);
 
-  if (!job) return void (await alert(t.expired));
-  if (rt.active.has(uid)) return void (await alert(t.busy));
-  const lim = dailyLimit();
-  if (lim > 0 && !DB.isAdmin(uid) && DB.downloadsToday(uid) >= lim) return void (await alert(t.limit(lim)));
-  if (!(await isSubscribed(ctx))) {
-    await ctx.answerCallbackQuery().catch(() => {});
-    return void (await requireSub(ctx, t));
+  if (!job) return ctx.answerCallbackQuery({ text: t.expired, show_alert: true });
+  if (active.has(uid)) return ctx.answerCallbackQuery({ text: t.busy, show_alert: true });
+
+  const limit = S.settings.dailyLimit;
+  if (limit > 0 && !S.isAdmin(uid) && S.dailyUsed(uid) >= limit) {
+    return ctx.answerCallbackQuery({ text: t.limit(limit), show_alert: true });
+  }
+  const missing = await missingChannels(ctx.api, uid);
+  if (missing.length) {
+    await ctx.answerCallbackQuery({ text: t.subNo, show_alert: true });
+    return ctx.reply(t.subNeed, { reply_markup: subKb(missing, t) });
   }
 
-  await ctx.answerCallbackQuery().catch(() => {});
-  rt.active.add(uid);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vd-"));
-  const status = (s) => editCard(ctx.api, job, `${clip(job.title, 150)}\n\n${s}`);
-  const kindLabel = q === "mp3" ? "mp3" : "video";
-  const log = (extra) =>
-    DB.logDownload({ userId: uid, platform: job.platform, kind: kindLabel, quality: q, title: job.title, url: job.url, ...extra });
+  await ctx.answerCallbackQuery();
+  active.add(uid);
+  runDownload(ctx, job, q, lang, t)
+    .catch((e) => console.error("runDownload:", e.message))
+    .finally(() => active.delete(uid));
+});
 
+/** Videoni (yoki MP3 ni) caption + «Ulashish» tugmasi bilan yuboradi */
+async function sendMedia(api, chatId, kind, file, job, lang, t, uid, me) {
+  const sid = S.newShareId();
+  const reply_markup = shareKb(t, sid, inlineOn, me.username);
+  const send = (extra) =>
+    kind === "mp3"
+      ? api.sendAudio(chatId, file, {
+          title: job.title.slice(0, 100),
+          performer: job.uploader || undefined,
+          duration: job.duration ? Math.round(job.duration) : undefined,
+          reply_markup,
+          ...extra,
+        })
+      : api.sendVideo(chatId, file, {
+          supports_streaming: true,
+          duration: job.duration ? Math.round(job.duration) : undefined,
+          reply_markup,
+          ...extra,
+        });
+
+  let msg;
   try {
-    await status(t.downloading);
-    const bu = ctx.me.username;
-    const isAudio = q === "mp3";
-    const caption = buildCaption(job.title, bu, { withTitle: !isAudio });
-    const shareId = crypto.randomBytes(4).toString("hex");
-    const kb = new InlineKeyboard().switchInline(t.share, `v${shareId}`);
-    const duration = job.duration ? Math.round(job.duration) : undefined;
-    const optsFor = (kind) =>
-      kind === "audio"
-        ? { title: job.title.slice(0, 100), performer: job.uploader || undefined, duration, caption, reply_markup: kb }
-        : kind === "document"
-          ? { caption, reply_markup: kb }
-          : { caption, supports_streaming: true, duration, reply_markup: kb };
+    msg = await send({ caption: buildCaption(job.title, lang, me.username), parse_mode: "HTML" });
+  } catch (e) {
+    if (!/parse entities/i.test(e.message)) throw e;
+    msg = await send({ caption: plainCaption(job.title, me.username) });
+  }
 
-    let sent = null, size = 0, cached = false;
+  let fid, type;
+  if (msg.audio) { fid = msg.audio.file_id; type = "audio"; }
+  else if (msg.video) { fid = msg.video.file_id; type = "video"; }
+  else if (msg.document) { fid = msg.document.file_id; type = "document"; }
+  if (fid) S.putShare(sid, { f: fid, t: type, n: job.title, o: uid });
+  return { fid, type };
+}
 
-    // Avval yuklangan bo'lsa, qayta yuklamaymiz: file_id orqali darhol yuboramiz
-    const hit = job.key ? DB.getCache(job.key, q) : null;
+async function runDownload(ctx, job, q, lang, t) {
+  const uid = ctx.from.id;
+  const chatId = ctx.chat.id;
+  const msgId = ctx.callbackQuery.message.message_id;
+  const isPhoto = !!ctx.callbackQuery.message.photo;
+  const kind = q === "mp3" ? "mp3" : "video";
+  const cacheKey = job.key ? `${job.key}|${q}` : null;
+  const action = kind === "mp3" ? "upload_voice" : "upload_video";
+
+  // rasmli xabarda caption, oddiy xabarda matn tahrirlanadi (tugmalar ham yo'qoladi)
+  const edit = (text) =>
+    (isPhoto
+      ? ctx.api.editMessageCaption(chatId, msgId, { caption: text })
+      : ctx.api.editMessageText(chatId, msgId, text)
+    ).catch(() => {});
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vd-"));
+  try {
+    // 1) Avval yuklangan bo'lsa — Telegramning o'zidan darhol yuboramiz
+    const hit = cacheKey && S.getCache(cacheKey);
     if (hit) {
       try {
-        sent = await sendMedia(ctx.api, job.chatId, hit.kind, hit.file_id, optsFor(hit.kind));
-        cached = true;
+        await ctx.api.sendChatAction(chatId, action).catch(() => {});
+        await sendMedia(ctx.api, chatId, kind, hit.f, job, lang, t, uid, ctx.me);
+        S.recordDownload(uid, { platform: job.platform, kind, cached: true });
+        await ctx.api.deleteMessage(chatId, msgId).catch(() => {});
+        return;
       } catch (e) {
-        console.error("kesh yaroqsiz:", e.message);
-        DB.delCache(job.key, q);
+        console.error("keshdan yuborib bo'lmadi:", e.message);
       }
     }
 
-    if (!sent) {
-      await acquire();
-      let res;
-      try { res = await download(job.url, q, dir); } finally { release(); }
-      size = res.size;
-      await status(t.uploading);
-      const kind = isAudio ? "audio" : "video";
-      sent = await sendMedia(ctx.api, job.chatId, kind, new InputFile(res.file), optsFor(kind));
+    // 2) Yuklab olish
+    await edit(t.downloading);
+    await acquire();
+    let res;
+    try {
+      res = await download(job.url, q, dir);
+    } finally {
+      release();
     }
 
-    const fileId = fileIdOf(sent);
-    const kind = kindOf(sent);
-    if (fileId) {
-      DB.addShare({ id: shareId, userId: uid, kind, fileId, title: job.title, caption });
-      if (job.key) DB.setCache(job.key, q, kind, fileId);
-    }
-    log({ ok: true, size, cached });
-    await ctx.api.deleteMessage(job.chatId, job.msgId).catch(() => {});
+    await edit(t.uploading);
+    await ctx.api.sendChatAction(chatId, action).catch(() => {});
+    const sent = await sendMedia(ctx.api, chatId, kind, new InputFile(res.file), job, lang, t, uid, ctx.me);
+    if (cacheKey && sent.fid) S.setCache(cacheKey, { f: sent.fid, t: sent.type });
+    S.recordDownload(uid, { platform: job.platform, kind, cached: false });
+    await ctx.api.deleteMessage(chatId, msgId).catch(() => {});
   } catch (e) {
     console.error("download xato:", e.message);
-    log({ ok: false, error: e instanceof TooBigError ? "Telegram 50MB chegarasi" : e.message });
-    await status(e instanceof TooBigError ? t.tooBig : t.failed);
+    S.bump("err");
+    await edit(e instanceof TooBigError ? t.tooBig : t.failed);
   } finally {
-    rt.active.delete(uid);
     fs.rm(dir, { recursive: true, force: true }, () => {});
   }
 }
@@ -334,25 +464,43 @@ async function processDownload(ctx, id, q) {
 // ---------- ishga tushirish ----------
 bot.catch((err) => console.error("Bot xatosi:", err.error?.message || err));
 
-const stop = () => bot.stop();
+let stopping = false;
+const stop = async () => {
+  if (stopping) return;
+  stopping = true;
+  S.flush(); // bazani diskka yozib qo'yamiz
+  try { await bot.stop(); } catch {}
+  process.exit(0);
+};
 process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
 
-await bot.init();
-const base = [
+const common = [
   { command: "start", description: "Start / Старт" },
-  { command: "lang", description: "Til / Язык / Language" },
   { command: "help", description: "Yordam / Помощь / Help" },
+  { command: "lang", description: "Til / Язык / Language" },
+  { command: "me", description: "Statistikam / Моя статистика / My stats" },
+  { command: "share", description: "Botni ulashish / Поделиться / Share" },
 ];
-await bot.api.setMyCommands(base).catch(() => {});
-for (const id of DB.allAdminIds()) {
+await bot.api.setMyCommands(common);
+for (const id of S.OWNERS) {
   await bot.api
-    .setMyCommands([...base, { command: "admin", description: "🛠 Admin panel" }], { scope: { type: "chat", chat_id: id } })
+    .setMyCommands(
+      [...common, { command: "admin", description: "🛠 Admin panel" }],
+      { scope: { type: "chat", chat_id: id } }
+    )
     .catch(() => {});
 }
 
+await refreshInline();
+setInterval(refreshInline, 5 * 60 * 1000).unref();
+if (!S.OWNERS.length)
+  console.warn("ADMIN_ID berilmagan: admin panel ishlamaydi. Botga /id yuborib ID ingizni bilib oling.");
+if (!inlineOn)
+  console.warn("Inline rejim o'chiq: «Ulashish» faqat bot havolasini ulashadi. @BotFather → /setinline qiling.");
+
 bot.start({
   drop_pending_updates: true,
-  allowed_updates: ["message", "callback_query", "inline_query", "chosen_inline_result", "my_chat_member"],
+  allowed_updates: ["message", "callback_query", "inline_query", "my_chat_member"],
   onStart: (me) => console.log(`@${me.username} ishga tushdi`),
 });
