@@ -160,6 +160,16 @@ async function sendStart(ctx, lang) {
   }
 }
 
+// Obuna bo'lmagan bo'lsa, kanallar ro'yxati bilan xabar yuboradi (true = to'sildi)
+async function promptSub(ctx, lang) {
+  if (!S.settings.subOnStart) return false;
+  const t = getT(lang);
+  const missing = await missingChannels(ctx.api, ctx.from.id);
+  if (!missing.length) return false;
+  await ctx.reply(t.subNeed, { reply_markup: subKb(missing, t) });
+  return true;
+}
+
 bot.command("start", async (ctx) => {
   const payload = String(ctx.match || "");
   const ref = payload.match(/^r(\d+)$/);
@@ -167,6 +177,7 @@ bot.command("start", async (ctx) => {
   const lang = S.getLang(ctx.from.id);
   if (!lang) return askLang(ctx);
   await sendStart(ctx, lang);
+  await promptSub(ctx, lang);
 });
 
 bot.command("lang", (ctx) => askLang(ctx));
@@ -198,6 +209,7 @@ bot.callbackQuery(/^lang:(uz|ru|en)$/, async (ctx) => {
   if (first) {
     await ctx.deleteMessage().catch(() => {});
     await sendStart(ctx, lang);
+    await promptSub(ctx, lang);
   } else {
     await ctx.editMessageText(getT(lang).welcome).catch(() => {});
   }

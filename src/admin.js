@@ -3,6 +3,7 @@ import { esc, toHtml, parseButtons, kbFrom } from "./format.js";
 import * as S from "./store.js";
 import { sendStored, startMessage, buildCaption } from "./messages.js";
 import { getT, LANGS } from "./i18n.js";
+import { statsText } from "./stats.js";
 
 const nf = (n) => String(n ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -74,36 +75,12 @@ export function registerAdmin(bot, deps) {
 
   // ---------- statistika ----------
   async function showStats(ctx) {
-    const s = S.getStats();
-    const t = s.today;
-    const L = [
-      "📊 <b>Statistika</b>",
-      "",
-      `👥 Jami foydalanuvchilar: <b>${nf(s.total)}</b>`,
-      `🟢 Faol: 24 soat — <b>${nf(s.a24)}</b> · 7 kun — <b>${nf(s.a7)}</b> · 30 kun — <b>${nf(s.a30)}</b>`,
-      `🆕 Yangi: 24 soat — <b>${nf(s.n24)}</b> · 7 kun — <b>${nf(s.n7)}</b> · 30 kun — <b>${nf(s.n30)}</b>`,
-      `🚫 Botni to'xtatgan: ${nf(s.blocked)} · Ban: ${nf(s.banned)}`,
-      `🔗 Ulashish orqali kelganlar: ${nf(s.referred)}`,
-      "",
-      `⬇️ <b>Yuklashlar</b>: jami ${nf(s.totalDl)} · 30 kun ${nf(s.dl30)} · 7 kun ${nf(s.dl7)} · bugun <b>${nf(t.dl)}</b>`,
-      `   ▶️ YouTube: ${nf(t.youtube)} · 📸 Instagram: ${nf(t.instagram)}  <i>(bugun)</i>`,
-      `   🎬 Video: ${nf(t.video)} · 🎵 MP3: ${nf(t.mp3)}  <i>(bugun)</i>`,
-      `   ⚡️ Keshdan (tezkor): ${nf(t.cached)} · ❌ Xatolar: ${nf(t.err)}  <i>(bugun)</i>`,
-      "",
-      `🌐 Tillar: 🇺🇿 ${nf(s.langs.uz)} · 🇷🇺 ${nf(s.langs.ru)} · 🇬🇧 ${nf(s.langs.en)} · tanlamagan ${nf(s.langs.none)}`,
-      `⚙️ Hozir ishlayotgan yuklashlar: ${deps.getRunning()}`,
-    ];
-    if (s.top.length) {
-      L.push("", "🏆 <b>Eng faol foydalanuvchilar</b>");
-      s.top.forEach((u, i) =>
-        L.push(`${i + 1}. ${esc(u.name || "—")}${u.username ? ` @${esc(u.username)}` : ""} · <code>${u.id}</code> — ${nf(u.dl)}`)
-      );
-    }
-    L.push("", "📅 <b>Oxirgi 7 kun</b> (yangi / yuklash / xato)", "<pre>");
-    for (const d of s.days) L.push(`${d.date}  +${d.new} / ${d.dl} / ${d.err}`);
-    L.push("</pre>");
+    const time = new Date().toLocaleTimeString("ru-RU", {
+      timeZone: "Asia/Tashkent", hour: "2-digit", minute: "2-digit",
+    });
+    const text = statsText(S.getStats(), { running: deps.getRunning(), time });
     const kb = new InlineKeyboard().text("🔄 Yangilash", "a:stats").text("🔙 Orqaga", "a:home");
-    await show(ctx, L.join("\n"), kb);
+    await show(ctx, text, kb);
   }
 
   // ---------- REKLAMA YUBORISH ----------
@@ -276,7 +253,9 @@ export function registerAdmin(bot, deps) {
       "📣 <b>Majburiy obuna</b>",
       "",
       `Holat: <b>${S.settings.subOn ? "✅ yoqilgan" : "🔕 o'chirilgan"}</b>`,
-      "Foydalanuvchi video yuklashdan oldin quyidagi kanallarga obuna bo'lishi shart. Bot kanalda <b>admin</b> bo'lishi kerak.",
+      `🚀 /start da tekshirish: <b>${S.settings.subOnStart ? "✅ yoqilgan" : "🔕 o'chirilgan"}</b>`,
+      "<i>Havola yuborilganda va yuklash tugmasi bosilganda obuna har doim tekshiriladi.</i>",
+      "Bot kanalda <b>admin</b> bo'lishi kerak.",
       "",
     ];
     if (!ch.length) L.push("<i>Kanal qo'shilmagan</i>");
@@ -284,7 +263,8 @@ export function registerAdmin(bot, deps) {
     const kb = new InlineKeyboard();
     ch.forEach((c, i) => kb.text(`🗑 ${i + 1}. ${c.title}`.slice(0, 40), `sb:del:${i}`).row());
     kb.text("➕ Kanal qo'shish", "sb:add").row()
-      .text(S.settings.subOn ? "🔕 O'chirish" : "🔔 Yoqish", "sb:tg").row()
+      .text(S.settings.subOn ? "🔕 Obunani o'chirish" : "🔔 Obunani yoqish", "sb:tg").row()
+      .text(S.settings.subOnStart ? "🔕 /start da tekshirmaslik" : "🔔 /start da tekshirish", "sb:st").row()
       .text("🔙 Orqaga", "a:home");
     await show(ctx, L.join("\n"), kb);
   }
@@ -494,6 +474,7 @@ export function registerAdmin(bot, deps) {
       // ----- majburiy obuna -----
       if (ns === "sb") {
         if (act === "tg") { S.settings.subOn = !S.settings.subOn; S.persist(); return showSub(ctx); }
+        if (act === "st") { S.settings.subOnStart = !S.settings.subOnStart; S.persist(); return showSub(ctx); }
         if (act === "del") {
           S.settings.channels.splice(Number(arg), 1);
           S.persist();

@@ -20,6 +20,7 @@ const defaults = () => ({
   admins: [], // panel orqali qo'shilgan adminlar
   channels: [], // majburiy obuna kanallari: {id,title,url,username}
   subOn: true,
+  subOnStart: true, // /start bosilganda ham obunani tekshirish
   maintenance: false,
   dailyLimit: 0, // 0 = cheksiz
   maxDurationMin: null, // null = ENV dagi qiymat
@@ -243,6 +244,10 @@ export function getStats() {
   s.today = db.daily[dayKey()] || {};
   s.dl7 = sum(7, "dl");
   s.dl30 = sum(30, "dl");
+  s.per = {};
+  for (const f of ["dl", "youtube", "instagram", "video", "mp3", "cached", "err"]) {
+    s.per[f] = { d1: sum(1, f), d7: sum(7, f), d30: sum(30, f) };
+  }
   s.days = [];
   for (let i = 0; i < 7; i++) {
     s.days.push({ date: dayKey(now - i * DAY), new: dayVal(i, "new"), dl: dayVal(i, "dl"), err: dayVal(i, "err") });
