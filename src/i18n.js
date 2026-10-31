@@ -18,7 +18,7 @@ const T = {
       `🎬 ${title}\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\nFormatni tanlang:`,
     downloading: "⏳ Yuklab olinmoqda...",
     uploading: "📤 Telegramga yuborilmoqda...",
-    tooBig: "⚠️ Fayl Telegram chegarasidan (50 MB) katta. Pastroq sifatni yoki MP3 ni tanlang.",
+    tooBig: "⚠️ Bu sifatdagi fayl juda katta, yuborib bo'lmadi. Pastroq sifatni yoki MP3 ni tanlang.",
     tooLong: (min) => `⚠️ Video juda uzun (maksimal ${min} daqiqa).`,
     failed:
       "❌ Yuklab bo'lmadi. Video yopiq bo'lishi yoki havola noto'g'ri bo'lishi mumkin. Keyinroq qayta urinib ko'ring.",
@@ -54,7 +54,7 @@ const T = {
       `🎬 ${title}\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\nВыберите формат:`,
     downloading: "⏳ Скачиваю...",
     uploading: "📤 Отправляю в Telegram...",
-    tooBig: "⚠️ Файл больше лимита Telegram (50 МБ). Выберите меньшее качество или MP3.",
+    tooBig: "⚠️ Файл в этом качестве слишком большой, отправить не получится. Выберите меньшее качество или MP3.",
     tooLong: (min) => `⚠️ Видео слишком длинное (максимум ${min} мин).`,
     failed:
       "❌ Не удалось скачать. Видео может быть закрытым, или ссылка неверна. Попробуйте позже.",
@@ -90,7 +90,7 @@ const T = {
       `🎬 ${title}\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\nChoose a format:`,
     downloading: "⏳ Downloading...",
     uploading: "📤 Sending to Telegram...",
-    tooBig: "⚠️ The file exceeds Telegram's 50 MB limit. Pick a lower quality or MP3.",
+    tooBig: "⚠️ This file is too large to send in that quality. Please pick a lower quality or MP3.",
     tooLong: (min) => `⚠️ The video is too long (max ${min} minutes).`,
     failed:
       "❌ Download failed. The video may be private or the link is wrong. Please try again later.",

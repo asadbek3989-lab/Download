@@ -35,7 +35,7 @@ git push -u origin main
    - `COOKIES_B64` = (pastga qarang, tavsiya etiladi)
    - `ADMIN_ID` = o'zingizning Telegram ID'ingiz (**admin panel uchun shart**; botga `/id` yuborsangiz ID ni ko'rsatadi)
    - `DATA_DIR` = `/app/data`
-4. Deploy tugagach loglarda `@botnomi ishga tushdi` chiqadi.
+4. Deploy tugagach loglarda `@TopVideoSaveBot ishga tushdi` chiqadi.
 Bot long-polling bilan ishlaydi, port yoki domen kerak emas.
 5. **Volume ulang (muhim):** servis → **Settings → Volumes → Add Volume**, Mount path: `/app/data`.
    Aks holda har redeploy'da foydalanuvchilar bazasi, statistika va sozlamalar o'chib ketadi.
@@ -74,9 +74,9 @@ Cookie'lar vaqt o'tib eskiradi, ishlamay qolsa qayta eksport qiling.
 | `ADMIN_ID` | Admin(lar) Telegram ID'si, vergul bilan: `111,222` | bo'sh |
 | `DATA_DIR` | Baza saqlanadigan papka (`db.json`) | ./data |
 | `TZ_NAME` | Statistika kunlari uchun vaqt mintaqasi | Asia/Tashkent |
+| `AUTO_PROFILE` | `0` bo'lsa, bot nomi/tavsifi avtomatik o'rnatilmaydi | yoqilgan |
 
 ## Cheklovlar
-- Telegram Bot API orqali fayl 50 MB gacha. Kattaroq videolar uchun pastroq sifat yoki MP3 taklif qilinadi.
 - Baza `DATA_DIR/db.json` da saqlanadi (eski `users.json` avtomatik ko'chiriladi). Volume ulang, aks holda redeploy'da o'chadi.
 - Faqat ochiq (public) kontent. Mualliflik huquqi va YouTube/Instagram shartlariga rioya qilish sizning javobgarligingizda.
 

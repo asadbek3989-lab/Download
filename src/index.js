@@ -10,6 +10,7 @@ import { registerAdmin } from "./admin.js";
 import {
   buildCaption, plainCaption, shareKb, startMessage, sendStored,
 } from "./messages.js";
+import { applyProfile, migrateUsername } from "./profile.js";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -506,6 +507,12 @@ for (const id of S.OWNERS) {
 
 await refreshInline();
 setInterval(refreshInline, 5 * 60 * 1000).unref();
+
+// Bot username'i tokendan avtomatik olinadi; saqlangan matnlarda eski username qolgan bo'lsa tuzatiladi
+const botInfo = await bot.api.getMe().catch(() => null);
+if (botInfo) migrateUsername(botInfo.username);
+// Bot profili (nom, qisqa tavsif, tavsif): uz/ru/en. O'chirish: AUTO_PROFILE=0
+applyProfile(bot.api).catch((e) => console.warn("Profil xatosi:", e.message));
 if (!S.OWNERS.length)
   console.warn("ADMIN_ID berilmagan: admin panel ishlamaydi. Botga /id yuborib ID ingizni bilib oling.");
 if (!inlineOn)
