@@ -1,765 +1,588 @@
-import { InlineKeyboard, InputFile } from "grammy";
-import { esc, toHtml, parseButtons, kbFrom } from "./format.js";
-import * as S from "./store.js";
-import { sendStored, startMessage, buildCaption } from "./messages.js";
-import { getT, LANGS } from "./i18n.js";
+import { InlineKeyboard, InputFile, GrammyError } from "grammy";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import * as DB from "./db.js";
+import { rt, spawnTask } from "./state.js";
+import { fmtBytes, parseButtons, toKb, sleep, clip } from "./utils.js";
+import { buildCaption, adTemplate, titleInCaption, DEFAULT_AD, getStartMsg } from "./content.js";
+import { hasCookies, saveCookies, updateYtdlp, ytdlpVersion } from "./ytdlp.js";
 
-const nf = (n) => String(n ?? 0).replace(/\B(?=(\d{3})+(?!\d))/g, " ");
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const TARGETS = ["all", "uz", "ru", "en"];
-const TARGET_NAME = { all: "🌐 Hammasi", uz: "🇺🇿 O'zbekcha", ru: "🇷🇺 Русский", en: "🇬🇧 English" };
-const BTN_HELP =
-  "Tugmalarni shunday yuboring:\n\n<code>Kanalimiz - https://t.me/kanal\nSayt - https://example.com</code>\n\n" +
-  "Bir qatorda bir nechta tugma uchun <code>|</code> ishlating:\n<code>Tugma 1 - https://a.uz | Tugma 2 - https://b.uz</code>";
+const S = new Map(); // admin holati: {mode, ...}
+let bcRun = null; // hozir ketayotgan reklama
+const LANG_NAMES = { uz: "🇺🇿 O'zbekcha", ru: "🇷🇺 Русский", en: "🇬🇧 English" };
 
-export function registerAdmin(bot, deps) {
-  const { isInlineOn, refreshInline } = deps;
-  const states = new Map(); // adminId -> {mode, ...}
-  let cur = null; // hozir ketayotgan reklama
+const menuKb = () =>
+  new InlineKeyboard()
+    .text("📊 Statistika", "a:stats").text("📣 Reklama yuborish", "a:bc").row()
+    .text("✏️ Start xabari", "a:start").text("🏷 Video caption", "a:cap").row()
+    .text("👤 Foydalanuvchilar", "a:users").text("⚙️ Sozlamalar", "a:set").row()
+    .text("🧰 Asboblar", "a:tools").text("👮 Adminlar", "a:adm").row()
+    .text("📥 Export / zaxira", "a:exp").text("⚠️ Oxirgi xatolar", "a:errs");
+const backKb = (to = "a:menu") => new InlineKeyboard().text("⬅️ Orqaga", to);
+const cancelKb = () => new InlineKeyboard().text("❌ Bekor qilish", "a:cancel");
 
-  // ---------- umumiy yordamchilar ----------
-  const opts = (kb) => ({
-    parse_mode: "HTML",
-    reply_markup: kb,
-    link_preview_options: { is_disabled: true },
-  });
+const bar = (n, max, w = 10) => "█".repeat(max ? Math.round((n / max) * w) : 0) || "·";
+
+export function registerAdmin(bot) {
+  const guard = (ctx) => ctx.from && DB.isAdmin(ctx.from.id);
 
   async function show(ctx, text, kb) {
-    if (ctx.callbackQuery?.message) {
-      try {
-        return await ctx.editMessageText(text, opts(kb));
-      } catch (e) {
-        if (/not modified/i.test(e.message)) return;
-      }
+    const opts = { reply_markup: kb };
+    text = clip(text, 4000);
+    try {
+      if (ctx.callbackQuery) await ctx.editMessageText(text, opts);
+      else await ctx.reply(text, opts);
+    } catch (e) {
+      if (!/not modified/i.test(e.message)) await ctx.reply(text, opts).catch(() => {});
     }
-    return ctx.reply(text, opts(kb));
   }
 
-  const back = (to = "a:home") => new InlineKeyboard().text("🔙 Orqaga", to);
-
-  /** Admin yuborgan xabardan start xabari uchun mazmunni olish */
-  function extractContent(msg) {
-    const text = msg.text ?? msg.caption ?? "";
-    const ents = msg.entities ?? msg.caption_entities ?? [];
-    let type = null;
-    let fid = null;
-    if (msg.text) type = "text";
-    else if (msg.photo) { type = "photo"; fid = msg.photo.at(-1).file_id; }
-    else if (msg.video) { type = "video"; fid = msg.video.file_id; }
-    else if (msg.animation) { type = "animation"; fid = msg.animation.file_id; }
-    if (!type) return null;
-    return { type, fid, html: toHtml(text, ents), len: text.length };
-  }
-
-  // ---------- bosh menyu ----------
-  const homeKb = () =>
-    new InlineKeyboard()
-      .text("📊 Statistika", "a:stats").text("📢 Reklama yuborish", "a:bc").row()
-      .text("👋 Start xabari", "a:start").text("🏷 Video reklamasi", "a:promo").row()
-      .text("📣 Majburiy obuna", "a:sub").text("👤 Foydalanuvchilar", "a:usr").row()
-      .text("⚙️ Sozlamalar", "a:set").text("💾 Backup", "a:bk").row()
-      .text("👮 Adminlar", "a:adm");
-
-  const home = (ctx) => show(ctx, "🛠 <b>Admin panel</b>\n\nKerakli bo'limni tanlang:", homeKb());
-
-  bot.command("admin", async (ctx) => {
-    if (ctx.chat.type !== "private" || !S.isAdmin(ctx.from.id)) return;
-    states.delete(ctx.from.id);
-    await home(ctx);
-  });
-  bot.command("stats", async (ctx) => {
-    if (ctx.chat.type !== "private" || !S.isAdmin(ctx.from.id)) return;
-    await showStats(ctx);
+  bot.command("admin", (ctx, next) => {
+    if (!guard(ctx)) return next();
+    S.delete(ctx.from.id);
+    return ctx.reply("🛠 Admin panel", { reply_markup: menuKb() });
   });
 
-  // ---------- statistika ----------
-  async function showStats(ctx) {
-    const s = S.getStats();
-    const t = s.today;
-    const L = [
-      "📊 <b>Statistika</b>",
-      "",
-      `👥 Jami foydalanuvchilar: <b>${nf(s.total)}</b>`,
-      `🟢 Faol: 24 soat — <b>${nf(s.a24)}</b> · 7 kun — <b>${nf(s.a7)}</b> · 30 kun — <b>${nf(s.a30)}</b>`,
-      `🆕 Yangi: 24 soat — <b>${nf(s.n24)}</b> · 7 kun — <b>${nf(s.n7)}</b> · 30 kun — <b>${nf(s.n30)}</b>`,
-      `🚫 Botni to'xtatgan: ${nf(s.blocked)} · Ban: ${nf(s.banned)}`,
-      `🔗 Ulashish orqali kelganlar: ${nf(s.referred)}`,
-      "",
-      `⬇️ <b>Yuklashlar</b>: jami ${nf(s.totalDl)} · 30 kun ${nf(s.dl30)} · 7 kun ${nf(s.dl7)} · bugun <b>${nf(t.dl)}</b>`,
-      `   ▶️ YouTube: ${nf(t.youtube)} · 📸 Instagram: ${nf(t.instagram)}  <i>(bugun)</i>`,
-      `   🎬 Video: ${nf(t.video)} · 🎵 MP3: ${nf(t.mp3)}  <i>(bugun)</i>`,
-      `   ⚡️ Keshdan (tezkor): ${nf(t.cached)} · ❌ Xatolar: ${nf(t.err)}  <i>(bugun)</i>`,
-      "",
-      `🌐 Tillar: 🇺🇿 ${nf(s.langs.uz)} · 🇷🇺 ${nf(s.langs.ru)} · 🇬🇧 ${nf(s.langs.en)} · tanlamagan ${nf(s.langs.none)}`,
-      `⚙️ Hozir ishlayotgan yuklashlar: ${deps.getRunning()}`,
-    ];
-    if (s.top.length) {
-      L.push("", "🏆 <b>Eng faol foydalanuvchilar</b>");
-      s.top.forEach((u, i) =>
-        L.push(`${i + 1}. ${esc(u.name || "—")}${u.username ? ` @${esc(u.username)}` : ""} · <code>${u.id}</code> — ${nf(u.dl)}`)
-      );
-    }
-    L.push("", "📅 <b>Oxirgi 7 kun</b> (yangi / yuklash / xato)", "<pre>");
-    for (const d of s.days) L.push(`${d.date}  +${d.new} / ${d.dl} / ${d.err}`);
-    L.push("</pre>");
-    const kb = new InlineKeyboard().text("🔄 Yangilash", "a:stats").text("🔙 Orqaga", "a:home");
-    await show(ctx, L.join("\n"), kb);
-  }
-
-  // ---------- REKLAMA YUBORISH ----------
-  const targetsOf = (target) =>
-    S.allUsers()
-      .filter(([, u]) => !u.blocked && !u.banned && (target === "all" || u.lang === target))
-      .map(([id]) => Number(id));
-
-  function bcText(d) {
+  // ================= matnlar =================
+  function statsText() {
+    const s = DB.getStats();
+    const u = s.users, d = s.dl, L = u.langs;
+    const maxD = Math.max(1, ...s.days.map((x) => x.dl));
+    const days = s.days
+      .map((x) => `${x.date}  ${bar(x.dl, maxD).padEnd(10, " ")} ${String(x.dl).padStart(4)} yuk. · +${x.users}`)
+      .join("\n");
+    const top = DB.topUsers(5)
+      .map((x, i) => `${i + 1}. ${x.first_name || x.id}${x.username ? " @" + x.username : ""} — ${x.downloads}`)
+      .join("\n");
     return (
-      `👆 <b>Reklama ko'rinishi</b> (yuqoridagi xabar)\n\n` +
-      `🎯 Auditoriya: <b>${TARGET_NAME[d.target]}</b>\n` +
-      `👥 Qabul qiluvchilar: <b>${nf(targetsOf(d.target).length)}</b> ta\n` +
-      `🔘 Tugmalar: ${d.rows.length ? `${d.rows.flat().length} ta` : "yo'q"}`
+      `📊 STATISTIKA\n\n` +
+      `👥 Foydalanuvchilar: ${u.total}\n` +
+      `   ├ faol: ${u.active}\n   ├ botni bloklagan: ${u.blocked}\n   └ ban qilingan: ${u.banned}\n` +
+      `🆕 Yangi: bugun ${u.new0} · 7 kun ${u.new7} · 30 kun ${u.new30}\n` +
+      `🟢 Faol: 24 soat ${u.seen24} · 7 kun ${u.seen7}\n` +
+      `🌐 Tillar: 🇺🇿 ${L.uz || 0} · 🇷🇺 ${L.ru || 0} · 🇬🇧 ${L.en || 0} · tanlamagan ${L["-"] || 0}\n\n` +
+      `📥 Yuklashlar: jami ${d.total}\n` +
+      `   ├ bugun ${d.today} · 7 kun ${d.d7} · 30 kun ${d.d30}\n` +
+      `   ├ 🎬 video ${d.video} · 🎵 MP3 ${d.mp3}\n` +
+      `   ├ ▶️ YouTube ${d.yt} · 📸 Instagram ${d.ig}\n` +
+      `   ├ ⚡️ keshdan (tez): ${d.cached}\n` +
+      `   ├ ❌ xato: ${d.failed} (bugun ${d.failedToday})\n` +
+      `   └ 💾 hajm: ${fmtBytes(d.bytes)}\n` +
+      `📤 Ulashish tugmasi: ${s.shares.total} ta video, ${s.shares.uses} marta tanlangan\n\n` +
+      `📅 So'nggi 7 kun (yuklash · yangi a'zo)\n${days}\n\n` +
+      (top ? `🏆 Top foydalanuvchilar\n${top}` : "")
     );
   }
-  function bcKb(d) {
-    const kb = new InlineKeyboard().text("🔗 Tugma qo'shish", "bc:btn");
-    if (d.rows.length) kb.text("🧹 Tugmalarni olib tashlash", "bc:clr");
-    kb.row()
-      .text(`🎯 Auditoriya: ${TARGET_NAME[d.target]}`, "bc:tg").row()
-      .text("👁 Testni o'zimga yuborish", "bc:test").row()
-      .text("🚀 Yuborish", "bc:go").text("❌ Bekor qilish", "bc:cancel");
-    return kb;
+
+  const userCard = (u) =>
+    `👤 ${u.first_name || "—"}${u.username ? " @" + u.username : ""}\n🆔 ${u.id}\n` +
+    `🌐 Til: ${u.lang || "tanlamagan"}\n📅 Qo'shilgan: ${DB.fmtDate(u.joined_at)}\n` +
+    `🕒 Oxirgi faollik: ${DB.fmtDate(u.last_seen)}\n📥 Yuklashlar: ${u.downloads}\n` +
+    `${u.banned ? "🚫 BAN qilingan" : "✅ Faol"}${u.blocked ? " · botni bloklagan" : ""}`;
+  const userKb = (u) =>
+    new InlineKeyboard()
+      .text(u.banned ? "✅ Bandan chiqarish" : "🚫 Ban qilish", u.banned ? `a:ub:${u.id}` : `a:bn:${u.id}`)
+      .text("✉️ Xabar yuborish", `a:dm:${u.id}`).row()
+      .text("⬅️ Orqaga", "a:users");
+
+  function settingsView() {
+    const maint = DB.getSetting("maintenance") === "1";
+    const fOn = DB.getSetting("force_on") === "1";
+    const ch = DB.getSetting("force_channel");
+    const dur = DB.getSetting("max_duration_min", process.env.MAX_DURATION_MIN || 90);
+    const lim = Number(DB.getSetting("daily_limit", 0));
+    const text =
+      `⚙️ SOZLAMALAR\n\n` +
+      `🛠 Texnik ishlar rejimi: ${maint ? "YOQILGAN 🔴" : "o'chiq 🟢"}\n` +
+      `   (yoqilsa, oddiy foydalanuvchilar botdan foydalana olmaydi)\n\n` +
+      `📢 Majburiy obuna: ${fOn ? "YOQILGAN" : "o'chiq"}\n   Kanal: ${ch || "—"}\n\n` +
+      `⏱ Maksimal video davomiyligi: ${dur} daqiqa\n` +
+      `📅 Kunlik limit (bitta foydalanuvchiga): ${lim > 0 ? lim + " ta" : "cheksiz"}`;
+    const kb = new InlineKeyboard()
+      .text(maint ? "🟢 Texnik ishlarni o'chirish" : "🔴 Texnik ishlarni yoqish", "a:sm").row()
+      .text(fOn ? "📢 Obunani o'chirish" : "📢 Obunani yoqish", "a:sf")
+      .text("🔗 Kanalni o'zgartirish", "a:sfc").row()
+      .text("⏱ Davomiylik", "a:sd").text("📅 Kunlik limit", "a:sl").row()
+      .text("⬅️ Orqaga", "a:menu");
+    return [text, kb];
   }
 
-  async function sendPreview(ctx, d) {
-    await ctx.api.copyMessage(ctx.chat.id, d.chatId, d.msgId, {
-      reply_markup: kbFrom(d.rows),
-    });
-    await ctx.reply(bcText(d), opts(bcKb(d)));
+  async function toolsView() {
+    const up = Math.floor((Date.now() - rt.started) / 60000);
+    let free = "—";
+    try { const f = fs.statfsSync(DB.DATA_DIR); free = fmtBytes(f.bavail * f.bsize); } catch {}
+    let dbSize = "—";
+    try { dbSize = fmtBytes(fs.statSync(DB.DB_FILE).size); } catch {}
+    const text =
+      `🧰 ASBOBLAR / SERVER HOLATI\n\n` +
+      `⏱ Ish vaqti: ${Math.floor(up / 60)} soat ${up % 60} daq.\n` +
+      `🧠 RAM: ${fmtBytes(process.memoryUsage().rss)}\n` +
+      `⚙️ Yuklashlar: ${rt.running} ishlayapti, ${rt.queued} navbatda\n` +
+      `🗄 Baza: ${dbSize} · bo'sh joy: ${free}\n` +
+      `📦 yt-dlp: ${await ytdlpVersion()}\n` +
+      `🍪 Cookies: ${hasCookies() ? "yuklangan ✅" : "yo'q ❌"}\n\n` +
+      `YouTube/Instagram "bot emasligingizni tasdiqlang" desa — cookies'ni yangilang. Yuklash umuman ishlamasa — yt-dlp'ni yangilang.`;
+    const kb = new InlineKeyboard()
+      .text("🍪 Cookies yuklash", "a:ck").text("🔄 yt-dlp yangilash", "a:ytu").row()
+      .text("🔃 Yangilash", "a:tools").text("⬅️ Orqaga", "a:menu");
+    return [text, kb];
   }
 
-  function bcMenuText() {
-    const last = S.lastBroadcast();
-    let t =
-      "📢 <b>Reklama yuborish</b>\n\n" +
-      "Reklama xabarini hozir shu yerga yuboring. Qo'llab-quvvatlanadi:\n" +
-      "• matn (qalin, havola, premium emoji saqlanadi)\n• rasm, video, GIF\n• ovozli xabar, audio, dumaloq video\n• fayl\n\n" +
-      "Tugmalarni keyingi bosqichda qo'shasiz. ⚠️ Albomlar (bir nechta rasm) qo'llab-quvvatlanmaydi.";
-    if (last) {
-      t +=
-        `\n\n📜 <b>Oxirgi reklama</b> (${new Date(last.ts).toLocaleString("ru-RU", { timeZone: "Asia/Tashkent" })}):\n` +
-        `✅ ${nf(last.sent)} yetkazildi · 🚫 ${nf(last.blocked)} bloklagan · ❌ ${nf(last.failed)} xato` +
-        `${last.stopped ? " · ⏹ to'xtatilgan" : ""}`;
-    }
-    return t;
-  }
-
-  async function runBroadcast(api, adminChat, d) {
-    const ids = targetsOf(d.target);
-    const job = { total: ids.length, sent: 0, failed: 0, blocked: 0, stop: false, done: false, ts: Date.now() };
-    cur = job;
-    const stopKb = new InlineKeyboard().text("⏹ To'xtatish", "bc:stop");
-    const prog = () =>
-      `📤 <b>Reklama yuborilmoqda...</b>\n\n` +
-      `${nf(job.sent + job.failed + job.blocked)} / ${nf(job.total)}\n` +
-      `✅ ${nf(job.sent)} · 🚫 ${nf(job.blocked)} · ❌ ${nf(job.failed)}`;
-    const pm = await api.sendMessage(adminChat, prog(), opts(stopKb));
-    const markup = kbFrom(d.rows);
-
-    async function one(uid) {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          await api.copyMessage(uid, d.chatId, d.msgId, { reply_markup: markup });
-          job.sent++;
-          return;
-        } catch (e) {
-          const desc = e.description || e.message || "";
-          if (e.error_code === 429) {
-            await sleep(((e.parameters?.retry_after || 5) + 1) * 1000);
-            continue;
-          }
-          if (e.error_code === 403 || /chat not found|user is deactivated|bot was blocked/i.test(desc)) {
-            S.markBlocked(uid, true);
-            job.blocked++;
-            return;
-          }
-          job.failed++;
-          if (job.failed <= 3) console.error("broadcast xato:", desc);
-          return;
-        }
-      }
-      job.failed++;
-    }
-
-    let lastEdit = Date.now();
-    try {
-      const BATCH = 20; // soniyasiga ~20 ta (Telegram chegarasi ~30)
-      for (let i = 0; i < ids.length && !job.stop; i += BATCH) {
-        const t0 = Date.now();
-        await Promise.all(ids.slice(i, i + BATCH).map(one));
-        const dt = Date.now() - t0;
-        if (dt < 1000) await sleep(1000 - dt);
-        if (Date.now() - lastEdit > 4000) {
-          lastEdit = Date.now();
-          await api.editMessageText(adminChat, pm.message_id, prog(), opts(stopKb)).catch(() => {});
-        }
-      }
-    } catch (e) {
-      console.error("broadcast to'xtadi:", e);
-    }
-    job.done = true;
-    S.addBroadcast({
-      ts: job.ts, total: job.total, sent: job.sent, failed: job.failed,
-      blocked: job.blocked, stopped: job.stop, by: adminChat,
-    });
-    await api
-      .editMessageText(
-        adminChat, pm.message_id,
-        `${job.stop ? "⏹ <b>Reklama to'xtatildi</b>" : "✅ <b>Reklama yuborib bo'lindi</b>"}\n\n` +
-          `👥 Jami: ${nf(job.total)}\n✅ Yetkazildi: ${nf(job.sent)}\n🚫 Bloklagan: ${nf(job.blocked)}\n❌ Xato: ${nf(job.failed)}`,
-        opts(back())
-      )
-      .catch(() => {});
-  }
-
-  // ---------- START XABARI ----------
-  async function showStartMenu(ctx) {
-    const L = ["👋 <b>Start xabari</b>", "", "Qaysi til uchun o'zgartirasiz?", ""];
-    for (const l of Object.keys(LANGS)) {
-      L.push(`${LANGS[l]} — ${S.settings.start[l] ? "✏️ maxsus" : "standart"}`);
-    }
+  function adminsView() {
+    const sup = DB.superAdmins();
+    const extra = DB.extraAdmins();
+    const text =
+      `👮 ADMINLAR\n\nAsosiy (ADMIN_ID, o'chirib bo'lmaydi):\n${sup.map((x) => "• " + x).join("\n") || "—"}\n\n` +
+      `Qo'shimcha:\n${extra.map((x) => "• " + x).join("\n") || "—"}`;
     const kb = new InlineKeyboard();
-    for (const l of Object.keys(LANGS)) kb.text(LANGS[l], `st:${l}`);
-    kb.row().text("🔙 Orqaga", "a:home");
-    await show(ctx, L.join("\n"), kb);
+    for (const id of extra) kb.text(`🗑 ${id}`, `a:adr:${id}`).row();
+    kb.text("➕ Admin qo'shish", "a:ada").row().text("⬅️ Orqaga", "a:menu");
+    return [text, kb];
   }
 
-  async function showStartLang(ctx, l) {
-    const m = startMessage(l);
-    await ctx.reply(`👇 <b>${LANGS[l]}</b> — hozirgi start xabari:`, { parse_mode: "HTML" });
-    try {
-      await sendStored(ctx.api, ctx.chat.id, m, ctx.me.username);
-    } catch (e) {
-      await ctx.reply("⚠️ Ko'rsatib bo'lmadi: " + esc(e.message));
-    }
+  async function captionView(me) {
+    const text =
+      `🏷 VIDEO CAPTION (reklama)\n\nHar bir yuklangan video/MP3 ostiga shu matn yoziladi. ` +
+      `Ulashilganda ham shu caption bilan boradi.\n\n` +
+      `Hozirgi matn:\n«${adTemplate()}»\n\n{bot} → @${me.username} ga almashadi.\n` +
+      `Videoning nomini captionga qo'shish: ${titleInCaption() ? "HA" : "YO'Q"}\n\n` +
+      `👁 Namuna:\n─────────\n${buildCaption("Namuna video nomi", me.username)}\n─────────`;
     const kb = new InlineKeyboard()
-      .text("✏️ Matnni o'zgartirish", `st:ed:${l}`).row()
-      .text("🔘 Tugmalar", `st:bt:${l}`).text("♻️ Standartga", `st:rs:${l}`).row()
-      .text("🔙 Orqaga", "a:start");
-    await ctx.reply(
-      `Tahrirlash: ${LANGS[l]}\n\n<i>Matnda <code>{bot}</code> yozsangiz, bot username'iga almashadi.</i>`,
-      opts(kb)
-    );
+      .text("✏️ Matnni o'zgartirish", "a:caps").row()
+      .text(titleInCaption() ? "🔁 Nomni o'chirish" : "🔁 Nomni yoqish", "a:capt")
+      .text("↩️ Standart", "a:capr").row()
+      .text("⬅️ Orqaga", "a:menu");
+    return [text, kb];
   }
 
-  // ---------- VIDEO REKLAMASI ----------
-  async function showPromo(ctx) {
-    const on = S.settings.promoOn;
-    const cur = (S.settings.promo ?? esc(getT("uz").promo)).replaceAll("{bot}", "@" + ctx.me.username);
-    const kb = new InlineKeyboard()
-      .text("✏️ O'zgartirish", "pr:ed").text("♻️ Standart", "pr:rs").row()
-      .text(on ? "🔕 O'chirish" : "🔔 Yoqish", "pr:tg").text("👁 Namuna", "pr:pv").row()
-      .text("🔙 Orqaga", "a:home");
-    await show(
-      ctx,
-      `🏷 <b>Video reklamasi</b>\n\nHar bir yuklangan video/MP3 ostiga (caption) video nomidan keyin qo'shiladi va «Ulashish» orqali ham ketadi.\n\n` +
-        `Holat: <b>${on ? "✅ yoqilgan" : "🔕 o'chirilgan"}</b>\n` +
-        `${S.settings.promo ? "" : "<i>(standart matn — foydalanuvchi tiliga qarab)</i>\n"}\n` +
-        `Joriy matn:\n<blockquote>${cur}</blockquote>`,
-      kb
-    );
-  }
+  const csv = (rows, cols) => {
+    const esc = (v) => (v == null ? "" : `"${String(v).replace(/"/g, '""')}"`);
+    return "\uFEFF" + [cols.join(","), ...rows.map((r) => cols.map((c) => esc(r[c])).join(","))].join("\n");
+  };
 
-  // ---------- MAJBURIY OBUNA ----------
-  async function showSub(ctx) {
-    const ch = S.settings.channels;
-    const L = [
-      "📣 <b>Majburiy obuna</b>",
-      "",
-      `Holat: <b>${S.settings.subOn ? "✅ yoqilgan" : "🔕 o'chirilgan"}</b>`,
-      "Foydalanuvchi video yuklashdan oldin quyidagi kanallarga obuna bo'lishi shart. Bot kanalda <b>admin</b> bo'lishi kerak.",
-      "",
-    ];
-    if (!ch.length) L.push("<i>Kanal qo'shilmagan</i>");
-    ch.forEach((c, i) => L.push(`${i + 1}. ${esc(c.title)} ${c.username ? "@" + esc(c.username) : ""}`));
-    const kb = new InlineKeyboard();
-    ch.forEach((c, i) => kb.text(`🗑 ${i + 1}. ${c.title}`.slice(0, 40), `sb:del:${i}`).row());
-    kb.text("➕ Kanal qo'shish", "sb:add").row()
-      .text(S.settings.subOn ? "🔕 O'chirish" : "🔔 Yoqish", "sb:tg").row()
-      .text("🔙 Orqaga", "a:home");
-    await show(ctx, L.join("\n"), kb);
-  }
-
-  // ---------- FOYDALANUVCHILAR ----------
-  async function showUsers(ctx) {
-    const kb = new InlineKeyboard()
-      .text("🔍 Foydalanuvchini topish", "us:find").row()
-      .text("🚫 Ban", "us:ban").text("✅ Bandan chiqarish", "us:unban").row()
-      .text("🔙 Orqaga", "a:home");
-    await show(ctx, "👤 <b>Foydalanuvchilar</b>\n\nID yoki @username bo'yicha topish, bloklash va shaxsiy xabar yuborish.", kb);
-  }
-
-  function resolveUserId(text) {
-    const t = String(text || "").trim();
-    if (/^\d{4,15}$/.test(t)) return Number(t);
-    if (/^@?\w{3,}$/.test(t)) return S.findByUsername(t);
-    return null;
-  }
-
-  async function userCard(ctx, id) {
-    const u = S.getUser(id);
-    if (!u) return ctx.reply("❌ Bunday foydalanuvchi bazada yo'q.", opts(back("a:usr")));
-    const fmt = (ts) => (ts ? new Date(ts).toLocaleString("ru-RU", { timeZone: "Asia/Tashkent" }) : "—");
-    const kb = new InlineKeyboard()
-      .text(u.banned ? "✅ Bandan chiqarish" : "🚫 Ban", `us:tb:${id}`)
-      .text("✉️ Xabar yuborish", `us:msg:${id}`).row()
-      .text("🔙 Orqaga", "a:usr");
-    await ctx.reply(
-      `👤 <b>${esc(u.name || "—")}</b> ${u.username ? "@" + esc(u.username) : ""}\n` +
-        `🆔 <code>${id}</code>\n🌐 Til: ${u.lang || "—"}\n` +
-        `📅 Qo'shilgan: ${fmt(u.joined)}\n🕒 Oxirgi faollik: ${fmt(u.last)}\n` +
-        `⬇️ Yuklashlar: ${nf(u.dl)}\n👥 Taklif qilgan: ${nf(u.refs)}\n` +
-        `${u.blocked ? "🚫 Botni bloklagan\n" : ""}${u.banned ? "⛔️ Ban qilingan\n" : ""}`,
-      opts(kb)
-    );
-  }
-
-  // ---------- SOZLAMALAR ----------
-  async function showSettings(ctx) {
-    const s = S.settings;
-    const inl = isInlineOn();
-    const kb = new InlineKeyboard()
-      .text(`🛠 Texnik ishlar: ${s.maintenance ? "YOQILGAN" : "o'chiq"}`, "se:mt").row()
-      .text(`📅 Kunlik limit: ${s.dailyLimit || "cheksiz"}`, "se:lim").row()
-      .text(`⏱ Maks. davomiylik: ${s.maxDurationMin ?? deps.defaultMaxMin} daq`, "se:dur").row()
-      .text(`💾 Avto-backup: ${s.autoBackup ? "✅" : "🔕"}`, "se:ab").row()
-      .text("🔄 Inline rejimni tekshirish", "se:inl").row()
-      .text("🔙 Orqaga", "a:home");
-    await show(
-      ctx,
-      "⚙️ <b>Sozlamalar</b>\n\n" +
-        `🛠 <b>Texnik ishlar</b> — yoqilganda oddiy foydalanuvchilarga bot ishlamaydi.\n` +
-        `📅 <b>Kunlik limit</b> — bitta foydalanuvchi kuniga nechta yuklay oladi (0 = cheksiz).\n` +
-        `💾 <b>Avto-backup</b> — har 12 soatda baza fayli asosiy adminga yuboriladi.\n\n` +
-        `🔎 Inline rejim: <b>${inl ? "✅ yoqilgan" : "❌ o'chiq"}</b>\n` +
-        (inl
-          ? "«📤 Ulashish» tugmasi videoning o'zini (caption bilan) jo'natadi."
-          : "⚠️ «Ulashish» hozircha faqat bot havolasini ulashadi. Videoning o'zini ulashish uchun: @BotFather → /setinline → botni tanlang → istalgan matn yozing. So'ng shu yerda «Inline rejimni tekshirish»ni bosing."),
-      kb
-    );
-  }
-
-  // ---------- BACKUP ----------
-  async function sendBackup(api, chatId, auto = false) {
-    const buf = Buffer.from(S.exportBackup());
-    await api.sendDocument(chatId, new InputFile(buf, `backup-${S.dayKey()}.json`), {
-      caption: `${auto ? "🕒 Avto-backup" : "💾 Backup"} · ${nf(S.allUsers().length)} foydalanuvchi`,
-    });
-  }
-
-  const autoTimer = setInterval(async () => {
-    if (!S.settings.autoBackup) return;
-    for (const id of S.OWNERS) {
-      try { await sendBackup(bot.api, id, true); } catch (e) { console.error("avto-backup:", e.message); }
-    }
-  }, 12 * 60 * 60 * 1000);
-  autoTimer.unref();
-
-  // ---------- ADMINLAR ----------
-  async function showAdmins(ctx) {
-    const L = ["👮 <b>Adminlar</b>", ""];
-    S.OWNERS.forEach((id) => L.push(`🔒 <code>${id}</code> — asosiy admin`));
-    S.settings.admins.forEach((id) => L.push(`👤 <code>${id}</code>`));
-    const kb = new InlineKeyboard();
-    if (S.isOwner(ctx.from.id)) {
-      S.settings.admins.forEach((id) => kb.text(`🗑 ${id}`, `ad:del:${id}`).row());
-      kb.text("➕ Admin qo'shish", "ad:add").row();
-    } else L.push("", "<i>Adminlarni faqat asosiy admin o'zgartira oladi.</i>");
-    kb.text("🔙 Orqaga", "a:home");
-    await show(ctx, L.join("\n"), kb);
-  }
-
-  // =====================================================================
-  //                         CALLBACK ROUTER
-  // =====================================================================
-  bot.callbackQuery(/^(a|bc|st|pr|sb|us|se|bk|ad):/, async (ctx) => {
-    const uid = ctx.from.id;
-    if (!S.isAdmin(uid)) return ctx.answerCallbackQuery({ text: "⛔️" });
+  // ================= callback tugmalar =================
+  bot.callbackQuery(/^a:/, async (ctx) => {
+    if (!guard(ctx)) return ctx.answerCallbackQuery().catch(() => {});
     await ctx.answerCallbackQuery().catch(() => {});
-    const data = ctx.callbackQuery.data;
-    const [ns, ...rest] = data.split(":");
-    const act = rest[0];
-    const arg = rest[1];
-    const st = states.get(uid);
-    const ask = (mode, text, extra = {}) => {
-      states.set(uid, { mode, ...extra });
-      return show(ctx, text, new InlineKeyboard().text("❌ Bekor qilish", "a:home"));
-    };
-    if (ns === "a") states.delete(uid);
+    const uid = ctx.from.id;
+    const [, act, p1] = ctx.callbackQuery.data.split(":");
 
-    try {
-      // ----- bosh bo'limlar -----
-      if (ns === "a") {
-        switch (act) {
-          case "home": return home(ctx);
-          case "stats": return showStats(ctx);
-          case "bc": return ask("bc_wait", bcMenuText());
-          case "start": return showStartMenu(ctx);
-          case "promo": return showPromo(ctx);
-          case "sub": return showSub(ctx);
-          case "usr": return showUsers(ctx);
-          case "set": return showSettings(ctx);
-          case "adm": return showAdmins(ctx);
-          case "bk":
-            return show(
-              ctx,
-              "💾 <b>Backup</b>\n\nBaza (foydalanuvchilar, sozlamalar, statistika) bitta JSON fayl bo'ladi. Railway'da Volume ulamagan bo'lsangiz, redeploy'da baza o'chadi — shunda backup'dan tiklaysiz.",
-              new InlineKeyboard()
-                .text("📥 Backup olish", "bk:get").text("📤 Tiklash", "bk:put").row()
-                .text("🔙 Orqaga", "a:home")
-            );
+    switch (act) {
+      case "menu":
+      case "cancel":
+        S.delete(uid);
+        return show(ctx, "🛠 Admin panel", menuKb());
+
+      case "stats":
+        return show(ctx, statsText(), new InlineKeyboard().text("🔃 Yangilash", "a:stats").text("⬅️ Orqaga", "a:menu"));
+
+      // ---------- reklama ----------
+      case "bc":
+        S.set(uid, { mode: "bc_msg" });
+        return show(
+          ctx,
+          "📣 REKLAMA YUBORISH\n\nReklama xabarini yuboring. Qo'llab-quvvatlanadi: matn, rasm, video, ovozli xabar, audio, GIF, hujjat (izoh bilan).\n\nMen uni aynan shu ko'rinishda hammaga yuboraman.\nBekor qilish: /cancel",
+          cancelKb()
+        );
+      case "bcnb": {
+        const st = S.get(uid);
+        if (!st || st.mode !== "bc_btn") return;
+        st.rows = null;
+        return askAudience(ctx, st);
+      }
+      case "bcaud": {
+        const st = S.get(uid);
+        if (!st || st.mode !== "bc_aud") return;
+        st.aud = p1 === "all" ? null : p1;
+        st.mode = "bc_confirm";
+        const n = DB.audienceCount(st.aud);
+        try {
+          await ctx.api.copyMessage(uid, st.src.chat, st.src.id, st.rows ? { reply_markup: toKb(st.rows) } : {});
+        } catch (e) {
+          return show(ctx, `❌ Xabarni ko'rsatib bo'lmadi: ${e.message}`, backKb());
         }
+        const kb = new InlineKeyboard().text(`✅ Yuborish (${n} ta)`, "a:bcgo").text("❌ Bekor", "a:cancel");
+        return ctx.reply(
+          `☝️ Reklama shunday ko'rinadi.\n\nQabul qiluvchilar: ${n} ta (${st.aud ? LANG_NAMES[st.aud] : "hamma"})\nTugmalar: ${st.rows ? "bor" : "yo'q"}\n\nYuboraymi?`,
+          { reply_markup: kb }
+        );
       }
+      case "bcgo": {
+        const st = S.get(uid);
+        if (!st || st.mode !== "bc_confirm") return;
+        if (bcRun) return show(ctx, "⏳ Boshqa reklama hozir yuborilmoqda. Tugashini kuting.", backKb());
+        S.delete(uid);
+        const msg = await ctx.api.sendMessage(uid, "📤 Reklama yuborish boshlandi...", {
+          reply_markup: new InlineKeyboard().text("⛔️ To'xtatish", "a:bcstop"),
+        });
+        spawnTask(() => runBroadcast(ctx.api, uid, st, msg.message_id));
+        return;
+      }
+      case "bcstop":
+        if (bcRun) bcRun.cancel = true;
+        return;
 
-      // ----- reklama -----
-      if (ns === "bc") {
-        const d = st?.draft;
-        if (act === "stop") {
-          if (cur && !cur.done) cur.stop = true;
-          return;
+      // ---------- start xabari ----------
+      case "start": {
+        if (!p1) {
+          const kb = new InlineKeyboard();
+          for (const l of ["uz", "ru", "en"]) kb.text(`${LANG_NAMES[l]} ${getStartMsg(l) ? "✏️" : ""}`, `a:start:${l}`).row();
+          kb.text("⬅️ Orqaga", "a:menu");
+          return show(ctx, "✏️ START XABARI\n\nQaysi til uchun /start xabarini o'zgartirasiz? (✏️ — o'zgartirilgan)", kb);
         }
-        if (!d) return show(ctx, "⌛ Reklama qoralamasi topilmadi. Qaytadan boshlang.", back());
-        switch (act) {
-          case "cancel":
-            states.delete(uid);
-            return home(ctx);
-          case "tg":
-            d.target = TARGETS[(TARGETS.indexOf(d.target) + 1) % TARGETS.length];
-            return show(ctx, bcText(d), bcKb(d));
-          case "btn":
-            states.set(uid, { mode: "bc_btn", draft: d });
-            return ctx.reply("🔗 <b>Tugmalar</b>\n\n" + BTN_HELP, opts(new InlineKeyboard().text("↩️ Bekor", "bc:back")));
-          case "back":
-            states.set(uid, { mode: "bc_ready", draft: d });
-            return show(ctx, bcText(d), bcKb(d));
-          case "clr":
-            d.rows = [];
-            return sendPreview(ctx, d);
-          case "test":
-            return ctx.api
-              .copyMessage(ctx.chat.id, d.chatId, d.msgId, { reply_markup: kbFrom(d.rows) })
-              .catch((e) => ctx.reply("❌ " + esc(e.message)));
-          case "go": {
-            if (cur && !cur.done) return ctx.reply("⏳ Boshqa reklama hali yuborilmoqda.");
-            const kb = new InlineKeyboard().text("✅ Ha, yuborish", "bc:yes").text("↩️ Yo'q", "bc:back");
-            return show(ctx, `⚠️ <b>${nf(targetsOf(d.target).length)}</b> ta foydalanuvchiga (${TARGET_NAME[d.target]}) yuborilsinmi?`, kb);
-          }
-          case "yes": {
-            if (cur && !cur.done) return;
-            states.delete(uid);
-            await show(ctx, "🚀 Yuborish boshlandi...", undefined);
-            runBroadcast(ctx.api, ctx.chat.id, d).catch((e) => console.error("runBroadcast:", e));
-            return;
-          }
+        const c = getStartMsg(p1);
+        const kb = new InlineKeyboard()
+          .text("✏️ Yangi xabar yuborish", `a:starts:${p1}`).row()
+          .text("↩️ Standartga qaytarish", `a:startr:${p1}`).row()
+          .text("⬅️ Orqaga", "a:start");
+        await show(ctx, `✏️ START XABARI — ${LANG_NAMES[p1]}\n\n${c ? "Hozir o'zgartirilgan xabar ishlatilmoqda (pastda)." : "Hozir standart xabar ishlatilmoqda."}`, kb);
+        if (c) await ctx.reply(c.text, { entities: c.entities }).catch(() => {});
+        return;
+      }
+      case "starts":
+        S.set(uid, { mode: "start_text", lang: p1 });
+        return show(ctx, `✏️ ${LANG_NAMES[p1]} uchun yangi /start xabarini yuboring.\n\nKalin, kursiv, havola kabi formatlash saqlanadi (Telegram'da matnni formatlab yuboring).\nBekor: /cancel`, cancelKb());
+      case "startr":
+        DB.delSetting(`start_${p1}`);
+        return show(ctx, "↩️ Standart xabarga qaytarildi.", backKb("a:start"));
+
+      // ---------- caption ----------
+      case "cap": {
+        const [text, kb] = await captionView(ctx.me);
+        return show(ctx, text, kb);
+      }
+      case "caps":
+        S.set(uid, { mode: "cap_text" });
+        return show(ctx, `🏷 Yangi reklama matnini yuboring (har bir video ostiga yoziladi).\n\n{bot} — bot username'iga almashadi. Masalan:\n📥 Yuklab olish: @{bot}\n\nBekor: /cancel`, cancelKb());
+      case "capt": {
+        DB.setSetting("caption_title", titleInCaption() ? "0" : "1");
+        const [text, kb] = await captionView(ctx.me);
+        return show(ctx, text, kb);
+      }
+      case "capr": {
+        DB.setSetting("caption_tpl", DEFAULT_AD);
+        const [text, kb] = await captionView(ctx.me);
+        return show(ctx, text, kb);
+      }
+
+      // ---------- foydalanuvchilar ----------
+      case "users": {
+        S.delete(uid);
+        const u = DB.getStats().users;
+        return show(
+          ctx,
+          `👤 FOYDALANUVCHILAR\n\nJami: ${u.total} · faol: ${u.active} · ban: ${u.banned}\n\nID yoki @username bo'yicha qidiring: ban qilish, bandan chiqarish, shaxsiy xabar yuborish mumkin.`,
+          new InlineKeyboard().text("🔎 Qidirish", "a:usr").text("🏆 Top 10", "a:top").row().text("⬅️ Orqaga", "a:menu")
+        );
+      }
+      case "usr":
+        S.set(uid, { mode: "user_find" });
+        return show(ctx, "🔎 Foydalanuvchi ID raqami yoki @username'ini yuboring.\nBekor: /cancel", cancelKb());
+      case "top": {
+        const rows = DB.topUsers(10);
+        const t = rows.length
+          ? rows.map((x, i) => `${i + 1}. ${x.first_name || "—"}${x.username ? " @" + x.username : ""} (${x.id}) — ${x.downloads}`).join("\n")
+          : "Hali yuklashlar yo'q.";
+        return show(ctx, `🏆 TOP 10 (yuklashlar soni)\n\n${t}`, backKb("a:users"));
+      }
+      case "bn":
+      case "ub": {
+        const id = Number(p1);
+        if (DB.isAdmin(id)) return show(ctx, "Adminni ban qilib bo'lmaydi.", backKb("a:users"));
+        DB.setBanned(id, act === "bn");
+        const u = DB.getUser(id);
+        return show(ctx, userCard(u), userKb(u));
+      }
+      case "dm":
+        S.set(uid, { mode: "dm", target: Number(p1) });
+        return show(ctx, `✉️ ${p1} ga yuboriladigan xabarni yuboring (matn/rasm/video/...).\nBekor: /cancel`, cancelKb());
+
+      // ---------- sozlamalar ----------
+      case "set": {
+        S.delete(uid);
+        const [t, kb] = settingsView();
+        return show(ctx, t, kb);
+      }
+      case "sm":
+        DB.setSetting("maintenance", DB.getSetting("maintenance") === "1" ? "0" : "1");
+        return show(ctx, ...settingsView());
+      case "sf":
+        if (DB.getSetting("force_on") !== "1" && !DB.getSetting("force_channel"))
+          return show(ctx, "Avval kanalni belgilang («🔗 Kanalni o'zgartirish»). Bot o'sha kanalda ADMIN bo'lishi kerak.", backKb("a:set"));
+        DB.setSetting("force_on", DB.getSetting("force_on") === "1" ? "0" : "1");
+        return show(ctx, ...settingsView());
+      case "sfc":
+        S.set(uid, { mode: "force_ch" });
+        return show(ctx, "🔗 Majburiy obuna kanalining @username'ini yuboring (masalan: @mening_kanalim).\n\n⚠️ Kanal ochiq bo'lishi va bot unda ADMIN bo'lishi shart.\nBekor: /cancel", cancelKb());
+      case "sd":
+        S.set(uid, { mode: "num", key: "max_duration_min", min: 1, label: "Maksimal video davomiyligi (daqiqa)" });
+        return show(ctx, "⏱ Maksimal video davomiyligini daqiqada yuboring (masalan: 60).\nBekor: /cancel", cancelKb());
+      case "sl":
+        S.set(uid, { mode: "num", key: "daily_limit", min: 0, label: "Kunlik limit" });
+        return show(ctx, "📅 Bitta foydalanuvchi bir kunda nechta video yuklay olishini yuboring (0 = cheksiz).\nBekor: /cancel", cancelKb());
+
+      // ---------- asboblar ----------
+      case "tools":
+        S.delete(uid);
+        return show(ctx, ...(await toolsView()));
+      case "ck":
+        S.set(uid, { mode: "cookies" });
+        return show(ctx, "🍪 cookies.txt faylini (Netscape format) hujjat sifatida yuboring. Yuborilgach xabaringiz xavfsizlik uchun o'chiriladi.\nBekor: /cancel", cancelKb());
+      case "ytu": {
+        await show(ctx, "🔄 yt-dlp yangilanmoqda...", undefined);
+        const out = await updateYtdlp();
+        return show(ctx, `🔄 Natija:\n${out}\n\nVersiya: ${await ytdlpVersion()}`, backKb("a:tools"));
+      }
+
+      // ---------- adminlar ----------
+      case "adm":
+        S.delete(uid);
+        return show(ctx, ...adminsView());
+      case "ada":
+        S.set(uid, { mode: "adm_add" });
+        return show(ctx, "➕ Yangi adminning Telegram ID raqamini yuboring (u botga /start bosgan bo'lishi kerak).\nBekor: /cancel", cancelKb());
+      case "adr":
+        if (!DB.isSuper(Number(p1))) DB.delAdmin(Number(p1));
+        return show(ctx, ...adminsView());
+
+      // ---------- export ----------
+      case "exp":
+        return show(
+          ctx,
+          "📥 EXPORT / ZAXIRA\n\nBaza zaxirasini vaqti-vaqti bilan olib turing: Railway'da volume bo'lmasa, qayta deploy qilganda ma'lumotlar o'chib ketadi.",
+          new InlineKeyboard()
+            .text("👥 Foydalanuvchilar (CSV)", "a:expu").row()
+            .text("📥 Yuklashlar (CSV)", "a:expd").row()
+            .text("💾 Bazani zaxiralash (.db)", "a:expb").row()
+            .text("⬅️ Orqaga", "a:menu")
+        );
+      case "expu": {
+        const rows = DB.allUsers().map((u) => ({
+          ...u, joined_at: DB.fmtDate(u.joined_at), last_seen: DB.fmtDate(u.last_seen),
+        }));
+        const text = csv(rows, ["id", "username", "first_name", "lang", "joined_at", "last_seen", "downloads", "banned", "blocked"]);
+        return void (await ctx.api.sendDocument(uid, new InputFile(Buffer.from(text), "users.csv"), { caption: `👥 ${rows.length} ta foydalanuvchi` }));
+      }
+      case "expd": {
+        const rows = DB.allDownloads(5000).map((d) => ({ ...d, ts: DB.fmtDate(d.ts) }));
+        const text = csv(rows, ["id", "ts", "user_id", "platform", "kind", "quality", "title", "url", "size", "ok", "error", "cached"]);
+        return void (await ctx.api.sendDocument(uid, new InputFile(Buffer.from(text), "downloads.csv"), { caption: `📥 oxirgi ${rows.length} ta yuklash` }));
+      }
+      case "expb": {
+        const tmp = path.join(os.tmpdir(), `bot-backup-${Date.now()}.db`);
+        try {
+          DB.backupTo(tmp);
+          if (fs.statSync(tmp).size > 49 * 1024 * 1024) return show(ctx, "⚠️ Baza 50 MB dan katta, Telegram orqali yuborib bo'lmaydi.", backKb("a:exp"));
+          await ctx.api.sendDocument(uid, new InputFile(tmp, "bot-backup.db"), { caption: "💾 Baza zaxirasi" });
+        } catch (e) {
+          await ctx.reply(`❌ Zaxira xatosi: ${e.message}`);
+        } finally {
+          fs.rm(tmp, { force: true }, () => {});
         }
+        return;
       }
 
-      // ----- start xabari -----
-      if (ns === "st") {
-        if (["uz", "ru", "en"].includes(act)) return showStartLang(ctx, act);
-        const l = arg;
-        if (act === "ed")
-          return ask("st_wait", `✏️ <b>${LANGS[l]}</b> uchun yangi start xabarini yuboring.\n\nMatn yoki rasm/video/GIF (izoh bilan) bo'lishi mumkin. Qalin, havola, premium emoji saqlanadi.\nBot username uchun <code>{bot}</code> yozing.`, { lang: l });
-        if (act === "bt")
-          return ask("st_btn", `🔘 <b>${LANGS[l]}</b> start xabari tugmalari\n\n${BTN_HELP}\n\nO'chirish uchun <code>yo'q</code> deb yozing.`, { lang: l });
-        if (act === "rs") {
-          S.settings.start[l] = null;
-          S.persist();
-          await ctx.reply(`♻️ ${LANGS[l]} — standart start xabari tiklandi.`);
-          return showStartLang(ctx, l);
-        }
+      case "errs": {
+        const rows = DB.recentFailures(10);
+        const t = rows.length
+          ? rows.map((r) => `• ${DB.fmtDate(r.ts)} · ${r.platform || "?"}/${r.kind || "?"}\n  ${clip(r.error || "—", 160)}\n  ${clip(r.url || "", 80)}`).join("\n\n")
+          : "✅ Xatolar yo'q.";
+        return show(ctx, `⚠️ OXIRGI XATOLAR\n\n${t}`, new InlineKeyboard().text("🔃 Yangilash", "a:errs").text("⬅️ Orqaga", "a:menu"));
       }
-
-      // ----- video reklamasi -----
-      if (ns === "pr") {
-        if (act === "ed")
-          return ask("pr_wait", "✏️ Video ostiga qo'shiladigan reklama matnini yuboring (faqat matn, 500 belgigacha).\n\n<code>{bot}</code> — bot username'iga, <code>{link}</code> — bot havolasiga almashadi.\nQalin, havola, premium emoji ishlaydi.");
-        if (act === "rs") { S.settings.promo = null; S.persist(); return showPromo(ctx); }
-        if (act === "tg") { S.settings.promoOn = !S.settings.promoOn; S.persist(); return showPromo(ctx); }
-        if (act === "pv") {
-          const cap = buildCaption("Namuna video nomi", "uz", ctx.me.username);
-          return ctx.reply("👇 Namuna (video caption'i shunday ko'rinadi):\n\n" + (cap || "<i>reklama o'chirilgan</i>"), opts());
-        }
-      }
-
-      // ----- majburiy obuna -----
-      if (ns === "sb") {
-        if (act === "tg") { S.settings.subOn = !S.settings.subOn; S.persist(); return showSub(ctx); }
-        if (act === "del") {
-          S.settings.channels.splice(Number(arg), 1);
-          S.persist();
-          return showSub(ctx);
-        }
-        if (act === "add")
-          return ask("sb_add", "➕ Kanalni qo'shish uchun <b>@username</b> yuboring yoki kanaldan biror xabarni shu yerga <b>forward</b> qiling.\n\n⚠️ Bot avval o'sha kanalga <b>admin</b> qilib qo'shilgan bo'lishi kerak.");
-      }
-
-      // ----- foydalanuvchilar -----
-      if (ns === "us") {
-        const prompts = {
-          find: ["us_find", "🔍 Foydalanuvchi ID raqami yoki @username yuboring:"],
-          ban: ["us_ban", "🚫 Ban qilinadigan foydalanuvchi ID/@username yuboring:"],
-          unban: ["us_unban", "✅ Bandan chiqariladigan foydalanuvchi ID/@username yuboring:"],
-        };
-        if (prompts[act]) return ask(...prompts[act]);
-        if (act === "tb") {
-          const id = Number(arg);
-          if (S.isAdmin(id)) return ctx.reply("❌ Adminni ban qilib bo'lmaydi.");
-          S.setBanned(id, !S.isBanned(id));
-          return userCard(ctx, id);
-        }
-        if (act === "msg")
-          return ask("us_msg", "✉️ Foydalanuvchiga yuboriladigan xabarni yuboring (istalgan turdagi):", { target: Number(arg) });
-      }
-
-      // ----- sozlamalar -----
-      if (ns === "se") {
-        if (act === "mt") { S.settings.maintenance = !S.settings.maintenance; S.persist(); return showSettings(ctx); }
-        if (act === "ab") { S.settings.autoBackup = !S.settings.autoBackup; S.persist(); return showSettings(ctx); }
-        if (act === "inl") { await refreshInline(); return showSettings(ctx); }
-        if (act === "lim") return ask("se_lim", "📅 Kunlik limitni raqam bilan yuboring (0 = cheksiz):");
-        if (act === "dur") return ask("se_dur", "⏱ Maksimal video davomiyligini daqiqada yuboring (masalan 60):");
-      }
-
-      // ----- backup -----
-      if (ns === "bk") {
-        if (act === "get") return sendBackup(ctx.api, ctx.chat.id).catch((e) => ctx.reply("❌ " + esc(e.message)));
-        if (act === "put")
-          return ask("bk_wait", "📤 Backup <b>.json</b> faylini yuboring.\n\n⚠️ Joriy ma'lumotlar to'liq almashtiriladi!");
-      }
-
-      // ----- adminlar -----
-      if (ns === "ad") {
-        if (!S.isOwner(uid)) return ctx.reply("⛔️ Faqat asosiy admin.");
-        if (act === "add")
-          return ask("ad_add", "➕ Yangi adminning Telegram ID raqamini yuboring yoki uning biror xabarini forward qiling.\n\n<i>ID ni @userinfobot orqali bilish mumkin.</i>");
-        if (act === "del") {
-          S.settings.admins = S.settings.admins.filter((x) => x !== Number(arg));
-          S.persist();
-          return showAdmins(ctx);
-        }
-      }
-    } catch (e) {
-      console.error("admin callback xato:", e);
-      await ctx.reply("❌ Xato: " + esc(e.message)).catch(() => {});
     }
   });
 
-  // =====================================================================
-  //                 ADMIN XABARLARI (holatga qarab)
-  // =====================================================================
+  // ================= reklama yordamchilari =================
+  function askAudience(ctx, st) {
+    st.mode = "bc_aud";
+    const kb = new InlineKeyboard()
+      .text(`🌐 Hammaga (${DB.audienceCount()})`, "a:bcaud:all").row()
+      .text(`🇺🇿 (${DB.audienceCount("uz")})`, "a:bcaud:uz")
+      .text(`🇷🇺 (${DB.audienceCount("ru")})`, "a:bcaud:ru")
+      .text(`🇬🇧 (${DB.audienceCount("en")})`, "a:bcaud:en").row()
+      .text("❌ Bekor", "a:cancel");
+    return show(ctx, "👥 Kimga yuboramiz?", kb);
+  }
+
+  async function sendOne(api, id, st, retry = true) {
+    try {
+      await api.copyMessage(id, st.src.chat, st.src.id, st.rows ? { reply_markup: toKb(st.rows) } : {});
+      return "ok";
+    } catch (e) {
+      if (e instanceof GrammyError) {
+        if (e.error_code === 429 && retry) {
+          await sleep(((e.parameters?.retry_after || 3) + 1) * 1000);
+          return sendOne(api, id, st, false);
+        }
+        if (e.error_code === 403) return "blocked";
+        if (e.error_code === 400 && /chat not found|deactivated|PEER_ID_INVALID/i.test(e.description || "")) return "blocked";
+      }
+      return "failed";
+    }
+  }
+
+  async function runBroadcast(api, adminId, st, msgId) {
+    const ids = DB.audience(st.aud);
+    const run = { cancel: false };
+    bcRun = run;
+    const total = ids.length;
+    let sent = 0, failed = 0, blocked = 0;
+    const t0 = Date.now();
+    const lines = () =>
+      `${bar(sent + failed + blocked, total, 20)} ${sent + failed + blocked}/${total}\n✅ yuborildi: ${sent}\n🚫 bloklagan: ${blocked}\n❌ xato: ${failed}`;
+    const edit = (text, kb) => api.editMessageText(adminId, msgId, text, { reply_markup: kb }).catch(() => {});
+    try {
+      for (let b = 0, n = 0; b < total && !run.cancel; b += 20, n++) {
+        const t1 = Date.now();
+        await Promise.all(
+          ids.slice(b, b + 20).map(async (id) => {
+            const r = await sendOne(api, id, st);
+            if (r === "ok") sent++;
+            else if (r === "blocked") { blocked++; DB.setBlocked(id, 1); }
+            else failed++;
+          })
+        );
+        const wait = 1100 - (Date.now() - t1); // ~18 xabar/soniya (Telegram limiti ~30)
+        if (wait > 0) await sleep(wait);
+        if (n % 3 === 0) await edit(`📤 Yuborilmoqda...\n\n${lines()}`, new InlineKeyboard().text("⛔️ To'xtatish", "a:bcstop"));
+      }
+    } finally {
+      bcRun = null;
+    }
+    DB.logBroadcast({ adminId, audience: st.aud || "all", total, sent, failed, blocked });
+    const secs = Math.round((Date.now() - t0) / 1000);
+    await edit(`${run.cancel ? "⛔️ REKLAMA TO'XTATILDI" : "✅ REKLAMA YUBORILDI"}\n\n${lines()}\n⏱ ${secs} soniya`, backKb());
+  }
+
+  // ================= admin xabarlari (holatga qarab) =================
   bot.on("message", async (ctx, next) => {
-    const uid = ctx.from?.id;
-    if (ctx.chat.type !== "private" || !S.isAdmin(uid)) return next();
-    const st = states.get(uid);
+    if (!guard(ctx) || ctx.chat.type !== "private") return next();
+    const uid = ctx.from.id;
+    const st = S.get(uid);
     if (!st) return next();
-    if (ctx.message.text?.startsWith("/")) {
-      states.delete(uid);
+    const text = ctx.message.text;
+
+    if (text?.startsWith("/")) {
+      if (/^\/cancel\b/i.test(text)) {
+        S.delete(uid);
+        return ctx.reply("Bekor qilindi.", { reply_markup: menuKb() });
+      }
+      S.delete(uid);
       return next();
     }
-    try {
-      await handleState(ctx, st);
-    } catch (e) {
-      console.error("admin state xato:", e);
-      await ctx.reply("❌ Xato: " + esc(e.message)).catch(() => {});
-    }
-  });
-
-  async function handleState(ctx, st) {
-    const uid = ctx.from.id;
-    const m = ctx.message;
-    const done = (text, kb = back()) => {
-      states.delete(uid);
-      return ctx.reply(text, opts(kb));
-    };
 
     switch (st.mode) {
-      // --- reklama xabari ---
-      case "bc_wait": {
-        if (m.media_group_id) {
-          return ctx.reply("⚠️ Albomlar qo'llab-quvvatlanmaydi. Bitta xabar yuboring (rasm/video + izoh).");
-        }
-        const d = { chatId: ctx.chat.id, msgId: m.message_id, rows: [], target: "all" };
-        try {
-          await sendPreview(ctx, d);
-        } catch (e) {
-          return ctx.reply("❌ Bu xabarni reklama qilib bo'lmadi: " + esc(e.message));
-        }
-        states.set(uid, { mode: "bc_ready", draft: d });
-        return;
-      }
+      case "bc_msg":
+        st.src = { chat: ctx.chat.id, id: ctx.message.message_id };
+        st.mode = "bc_btn";
+        return ctx.reply(
+          "🔘 Xabar ostiga tugma qo'shasizmi?\n\nHar qator — bitta qator tugma. Format:\nMatn - https://havola\n\nBir qatorda bir nechta tugma uchun | belgisi:\nKanal - https://t.me/kanal | Sayt - https://example.com\n\nTugma kerak bo'lmasa pastdagi tugmani bosing.",
+          { reply_markup: new InlineKeyboard().text("⏭ Tugmasiz davom etish", "a:bcnb").row().text("❌ Bekor", "a:cancel") }
+        );
+
       case "bc_btn": {
-        if (!m.text) return ctx.reply("Tugmalarni matn ko'rinishida yuboring.");
-        let rows;
+        if (!text) return ctx.reply("Tugmalarni matn ko'rinishida yuboring yoki «Tugmasiz» ni bosing.");
+        const r = parseButtons(text);
+        if (r.error) return ctx.reply(`❌ ${r.error}\n\nQaytadan yuboring (format: Matn - https://havola).`);
+        st.rows = r.rows;
+        return askAudience(ctx, st);
+      }
+
+      case "start_text": {
+        if (!text) return ctx.reply("Faqat matn yuboring.");
+        DB.setSetting(`start_${st.lang}`, JSON.stringify({ text, entities: ctx.message.entities || [] }));
+        S.delete(uid);
+        await ctx.reply("✅ Saqlandi. Foydalanuvchilar quyidagicha ko'radi:");
+        await ctx.reply(text, { entities: ctx.message.entities });
+        return ctx.reply("🛠 Admin panel", { reply_markup: menuKb() });
+      }
+
+      case "cap_text": {
+        if (!text) return ctx.reply("Faqat matn yuboring.");
+        DB.setSetting("caption_tpl", text.slice(0, 500));
+        S.delete(uid);
+        const [t, kb] = await captionView(ctx.me);
+        return ctx.reply(`✅ Saqlandi.\n\n${t}`, { reply_markup: kb });
+      }
+
+      case "user_find": {
+        if (!text) return ctx.reply("ID yoki @username yuboring.");
+        const u = DB.findUser(text);
+        if (!u) return ctx.reply("❌ Topilmadi. Qaytadan yuboring yoki /cancel.");
+        S.delete(uid);
+        return ctx.reply(userCard(u), { reply_markup: userKb(u) });
+      }
+
+      case "dm":
         try {
-          rows = parseButtons(m.text);
+          await ctx.api.copyMessage(st.target, ctx.chat.id, ctx.message.message_id);
+          await ctx.reply("✅ Yuborildi.", { reply_markup: backKb("a:users") });
         } catch (e) {
-          return ctx.reply("❌ " + esc(e.message) + "\n\n" + BTN_HELP, opts());
+          await ctx.reply(`❌ Yuborib bo'lmadi: ${e.description || e.message}`);
         }
-        st.draft.rows = rows;
-        states.set(uid, { mode: "bc_ready", draft: st.draft });
-        try {
-          await sendPreview(ctx, st.draft);
-        } catch (e) {
-          st.draft.rows = [];
-          return ctx.reply("❌ Telegram tugmalarni qabul qilmadi: " + esc(e.message));
-        }
+        S.delete(uid);
         return;
-      }
 
-      // --- start xabari ---
-      case "st_wait": {
-        const c = extractContent(m);
-        if (!c) return ctx.reply("Matn, rasm, video yoki GIF yuboring.");
-        if (c.type !== "text" && c.len > 1000) return ctx.reply("⚠️ Izoh 1000 belgidan oshmasligi kerak.");
-        const old = S.settings.start[st.lang];
-        S.settings.start[st.lang] = { type: c.type, fid: c.fid, html: c.html, buttons: old?.buttons || [] };
-        S.persist();
-        states.delete(uid);
-        await ctx.reply("✅ Start xabari saqlandi.");
-        return showStartLang(ctx, st.lang);
-      }
-      case "st_btn": {
-        if (!m.text) return ctx.reply("Tugmalarni matn ko'rinishida yuboring.");
-        let rows = [];
-        if (!/^(yo'q|yoq|no|нет|-)$/i.test(m.text.trim())) {
-          try {
-            rows = parseButtons(m.text);
-          } catch (e) {
-            return ctx.reply("❌ " + esc(e.message) + "\n\n" + BTN_HELP, opts());
-          }
-        }
-        const cur0 = S.settings.start[st.lang] || { ...startMessage(st.lang) };
-        S.settings.start[st.lang] = { ...cur0, buttons: rows };
-        S.persist();
-        states.delete(uid);
-        await ctx.reply("✅ Tugmalar saqlandi.");
-        return showStartLang(ctx, st.lang);
-      }
-
-      // --- video reklamasi ---
-      case "pr_wait": {
-        if (!m.text) return ctx.reply("Faqat matn yuboring.");
-        if (m.text.length > 500) return ctx.reply("⚠️ 500 belgidan oshmasin.");
-        S.settings.promo = toHtml(m.text, m.entities);
-        S.settings.promoOn = true;
-        S.persist();
-        states.delete(uid);
-        await ctx.reply("✅ Reklama matni saqlandi.");
-        return showPromo(ctx);
-      }
-
-      // --- majburiy obuna: kanal qo'shish ---
-      case "sb_add": {
-        let ref = null;
-        if (m.forward_origin?.type === "channel") ref = m.forward_origin.chat.id;
-        else if (m.text) {
-          const t = m.text.trim().replace(/^https?:\/\/t\.me\//i, "@");
-          if (/^@?[A-Za-z]\w{3,}$/.test(t)) ref = t.startsWith("@") ? t : "@" + t;
-        }
-        if (!ref) return ctx.reply("❌ @username yuboring yoki kanaldan xabar forward qiling.");
-        let chat;
+      case "force_ch": {
+        const ch = (text || "").trim();
+        if (!/^@[A-Za-z0-9_]{4,}$/.test(ch)) return ctx.reply("❌ Faqat ochiq kanal @username'i (masalan: @mening_kanalim).");
+        let warn = "";
         try {
-          chat = await ctx.api.getChat(ref);
-        } catch {
-          return ctx.reply("❌ Kanal topilmadi. Bot shu kanalga admin qilib qo'shilganini tekshiring.");
-        }
-        if (chat.type !== "channel" && chat.type !== "supergroup")
-          return ctx.reply("❌ Bu kanal/guruh emas.");
-        try {
-          const me = await ctx.api.getChatMember(chat.id, ctx.me.id);
-          if (me.status !== "administrator" && me.status !== "creator")
-            return ctx.reply("❌ Bot bu kanalda admin emas. Avval botni admin qiling.");
-        } catch {
-          return ctx.reply("❌ Bot kanalga kira olmadi. Admin qilib qo'shing.");
-        }
-        let url = chat.username ? `https://t.me/${chat.username}` : null;
-        if (!url) {
-          try { url = await ctx.api.exportChatInviteLink(chat.id); } catch {}
-        }
-        if (!url) return ctx.reply("❌ Kanal havolasini olib bo'lmadi (botga «havola yaratish» huquqini bering).");
-        if (S.settings.channels.some((c) => c.id === chat.id)) return done("ℹ️ Bu kanal allaqachon qo'shilgan.");
-        S.settings.channels.push({ id: chat.id, title: chat.title, username: chat.username || null, url });
-        S.persist();
-        states.delete(uid);
-        await ctx.reply(`✅ «${esc(chat.title)}» qo'shildi.`, { parse_mode: "HTML" });
-        return showSub(ctx);
-      }
-
-      // --- foydalanuvchilar ---
-      case "us_find":
-      case "us_ban":
-      case "us_unban": {
-        const id = resolveUserId(m.text);
-        if (!id || !S.getUser(id)) return ctx.reply("❌ Foydalanuvchi bazada topilmadi. ID yoki @username ni tekshiring.");
-        if (st.mode === "us_find") {
-          states.delete(uid);
-          return userCard(ctx, id);
-        }
-        if (S.isAdmin(id)) return ctx.reply("❌ Adminni ban qilib bo'lmaydi.");
-        S.setBanned(id, st.mode === "us_ban");
-        states.delete(uid);
-        return userCard(ctx, id);
-      }
-      case "us_msg": {
-        states.delete(uid);
-        try {
-          await ctx.api.copyMessage(st.target, ctx.chat.id, m.message_id);
-          return ctx.reply("✅ Yuborildi.", opts(back("a:usr")));
+          const chat = await ctx.api.getChat(ch);
+          if (chat.type !== "channel") return ctx.reply("❌ Bu kanal emas.");
+          const me = await ctx.api.getChatMember(ch, ctx.me.id);
+          if (!["administrator", "creator"].includes(me.status)) warn = "\n\n⚠️ Bot bu kanalda ADMIN emas — obunani tekshira olmaydi. Botni kanalga admin qiling.";
         } catch (e) {
-          return ctx.reply("❌ Yuborib bo'lmadi: " + esc(e.description || e.message), opts(back("a:usr")));
+          return ctx.reply(`❌ Kanal topilmadi yoki bot unga kira olmaydi: ${e.description || e.message}`);
+        }
+        DB.setSetting("force_channel", ch);
+        S.delete(uid);
+        const [t, kb] = settingsView();
+        return ctx.reply(`✅ Kanal saqlandi: ${ch}${warn}\n\n${t}`, { reply_markup: kb });
+      }
+
+      case "num": {
+        const n = Number((text || "").trim());
+        if (!Number.isInteger(n) || n < st.min || n > 100000) return ctx.reply(`❌ ${st.min} dan 100000 gacha butun son yuboring.`);
+        DB.setSetting(st.key, n);
+        S.delete(uid);
+        const [t, kb] = settingsView();
+        return ctx.reply(`✅ Saqlandi.\n\n${t}`, { reply_markup: kb });
+      }
+
+      case "cookies": {
+        const doc = ctx.message.document;
+        if (!doc) return ctx.reply("cookies.txt faylini hujjat (document) sifatida yuboring.");
+        if (doc.file_size > 2 * 1024 * 1024) return ctx.reply("❌ Fayl juda katta (maks. 2 MB).");
+        try {
+          const f = await ctx.api.getFile(doc.file_id);
+          const root = process.env.TG_API_ROOT || "https://api.telegram.org";
+          const r = await fetch(`${root}/file/bot${bot.token}/${f.file_path}`);
+          if (!r.ok) throw new Error(`yuklab olinmadi (${r.status})`);
+          const buf = Buffer.from(await r.arrayBuffer());
+          const body = buf.toString("utf8");
+          const yt = (body.match(/youtube\.com/g) || []).length;
+          const ig = (body.match(/instagram\.com/g) || []).length;
+          if (!yt && !ig) return ctx.reply("❌ Faylda youtube.com yoki instagram.com cookie'lari topilmadi. To'g'ri (Netscape) formatdagi cookies.txt yuboring.");
+          saveCookies(buf);
+          S.delete(uid);
+          await ctx.api.deleteMessage(ctx.chat.id, ctx.message.message_id).catch(() => {});
+          return ctx.reply(`✅ Cookies saqlandi (YouTube: ${yt}, Instagram: ${ig} ta yozuv). Xabaringiz o'chirildi.`, { reply_markup: backKb("a:tools") });
+        } catch (e) {
+          return ctx.reply(`❌ Xato: ${e.message}`);
         }
       }
 
-      // --- sozlamalar ---
-      case "se_lim": {
-        const n = Number(String(m.text || "").trim());
-        if (!Number.isInteger(n) || n < 0 || n > 100000) return ctx.reply("❌ 0 dan katta butun son yuboring.");
-        S.settings.dailyLimit = n;
-        S.persist();
-        states.delete(uid);
-        return showSettings(ctx);
-      }
-      case "se_dur": {
-        const n = Number(String(m.text || "").trim());
-        if (!Number.isInteger(n) || n < 1 || n > 600) return ctx.reply("❌ 1 dan 600 gacha son yuboring.");
-        S.settings.maxDurationMin = n;
-        S.persist();
-        states.delete(uid);
-        return showSettings(ctx);
-      }
-
-      // --- backup tiklash ---
-      case "bk_wait": {
-        if (!m.document) return ctx.reply("❌ .json faylni hujjat (document) sifatida yuboring.");
-        if (m.document.file_size > 20 * 1024 * 1024) return ctx.reply("❌ Fayl juda katta (20 MB gacha).");
-        const f = await ctx.api.getFile(m.document.file_id);
-        const r = await fetch(`https://api.telegram.org/file/bot${bot.token}/${f.file_path}`);
-        if (!r.ok) throw new Error("Faylni yuklab bo'lmadi");
-        const n = S.importBackup(JSON.parse(await r.text()));
-        return done(`✅ Tiklandi: ${nf(n)} foydalanuvchi.`);
-      }
-
-      // --- admin qo'shish ---
-      case "ad_add": {
-        let id = null;
-        if (m.forward_origin?.type === "user") id = m.forward_origin.sender_user.id;
-        else if (/^\d{5,15}$/.test((m.text || "").trim())) id = Number(m.text.trim());
-        if (!id) return ctx.reply("❌ ID raqam yuboring yoki foydalanuvchi xabarini forward qiling.");
-        if (!S.isAdmin(id)) S.settings.admins.push(id);
-        S.persist();
-        states.delete(uid);
-        return showAdmins(ctx);
+      case "adm_add": {
+        const id = Number((text || "").trim());
+        if (!Number.isInteger(id) || id <= 0) return ctx.reply("❌ Faqat raqamli ID yuboring.");
+        DB.addAdmin(id);
+        S.delete(uid);
+        const [t, kb] = adminsView();
+        return ctx.reply(`✅ Qo'shildi: ${id}\n\n${t}`, { reply_markup: kb });
       }
     }
-  }
+    return next();
+  });
 }
