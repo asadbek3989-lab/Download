@@ -1,0 +1,14 @@
+{
+  "name": "video-downloader-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot: YouTube & Instagram video/MP3 downloader (uz/ru/en)",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "grammy": "^1.30.0"
+  }
+}
