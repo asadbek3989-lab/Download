@@ -78,8 +78,15 @@ const P = {
   },
 };
 
-// [Telegram til kodi, matn tili]. Til kodisiz yozuv — boshqa tillardagi foydalanuvchilar uchun (o'zbekcha).
-const TARGETS = [["uz", "uz"], ["ru", "ru"], ["en", "en"], [undefined, "uz"]];
+// Telegram profil matnini foydalanuvchining TELEGRAM ILOVASI tiliga qarab ko'rsatadi (ko'p o'zbeklarda u
+// inglizcha yoki ruscha). Shuning uchun standart rejimda hamma tilga O'ZBEKCHA matn qo'yiladi
+// (tavsif oxirida bitta ruscha qator bilan). Uch tilli rejim: PROFILE_MODE=multi
+const MULTI = process.env.PROFILE_MODE === "multi";
+const RU_LINE = "\n\n🇷🇺 Скачивает видео и MP3 с YouTube и Instagram. Отправьте ссылку!";
+// [Telegram til kodi, matn tili]. Til kodisiz yozuv — boshqa barcha tillar uchun.
+const TARGETS = MULTI
+  ? [["uz", "uz"], ["ru", "ru"], ["en", "en"], [undefined, "uz"]]
+  : [["uz", "uz"], ["ru", "uz"], ["en", "uz"], [undefined, "uz"]];
 
 export async function applyProfile(api) {
   if (process.env.AUTO_PROFILE === "0") return;
@@ -87,10 +94,11 @@ export async function applyProfile(api) {
     const p = P[l];
     const extra = code ? { language_code: code } : {};
     const tag = code || "default";
+    const desc = !MULTI ? p.desc + RU_LINE : p.desc;
     const steps = [
       ["name", () => api.getMyName(extra), (v) => v?.name, () => api.setMyName(p.name, extra), p.name],
       ["short", () => api.getMyShortDescription(extra), (v) => v?.short_description, () => api.setMyShortDescription(p.short, extra), p.short],
-      ["desc", () => api.getMyDescription(extra), (v) => v?.description, () => api.setMyDescription(p.desc, extra), p.desc],
+      ["desc", () => api.getMyDescription(extra), (v) => v?.description, () => api.setMyDescription(desc, extra), desc],
     ];
     for (const [what, get, pick, set, want] of steps) {
       try {

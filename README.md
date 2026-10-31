@@ -75,6 +75,7 @@ Cookie'lar vaqt o'tib eskiradi, ishlamay qolsa qayta eksport qiling.
 | `DATA_DIR` | Baza saqlanadigan papka (`db.json`) | ./data |
 | `TZ_NAME` | Statistika kunlari uchun vaqt mintaqasi | Asia/Tashkent |
 | `AUTO_PROFILE` | `0` bo'lsa, bot nomi/tavsifi avtomatik o'rnatilmaydi | yoqilgan |
+| `PROFILE_MODE` | `multi` bo'lsa, profil uz/ru/en tillarida alohida; aks holda hamma tilga o'zbekcha | o'zbekcha |
 
 ## Cheklovlar
 - Baza `DATA_DIR/db.json` da saqlanadi (eski `users.json` avtomatik ko'chiriladi). Volume ulang, aks holda redeploy'da o'chadi.
