@@ -16,5 +16,7 @@ RUN npm install --omit=dev
 COPY src ./src
 
 ENV NODE_ENV=production
+# Baza shu papkada saqlanadi. Railway'da shu yo'lga Volume ulang (README ga qarang)
+ENV DATA_DIR=/app/data
 # Har ishga tushganda yt-dlp'ni yangilab oladi (YouTube tez-tez o'zgaradi)
 CMD ["sh", "-c", "yt-dlp -U || true; node src/index.js"]

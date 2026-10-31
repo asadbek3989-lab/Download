@@ -58,6 +58,20 @@ function run(args, timeoutMs = 10 * 60 * 1000) {
 
 const sizeOf = (f) => f?.filesize || f?.filesize_approx || null;
 
+// Muqova: webp bo'lmagan, 1280px gacha eng kattasi
+function pickThumb(info) {
+  const list = (info.thumbnails || [])
+    .filter((t) => t.url && !/\.webp(\?|$)/i.test(t.url) && (!t.width || t.width <= 1280))
+    .sort((a, b) => (a.width || 0) * (a.height || 0) - (b.width || 0) * (b.height || 0));
+  return (
+    list.at(-1)?.url ||
+    info.thumbnail ||
+    (/youtube/i.test(info.extractor_key || "") && info.id
+      ? `https://i.ytimg.com/vi/${info.id}/hqdefault.jpg`
+      : null)
+  );
+}
+
 export async function getInfo(url) {
   const { out } = await run([...commonArgs(), "-J", url], 90 * 1000);
   const json = JSON.parse(out);
@@ -96,6 +110,8 @@ export async function getInfo(url) {
   if (!video.length) options.push({ q: "best", label: null });
 
   return {
+    key: info.id ? `${(info.extractor_key || "x").toLowerCase()}:${info.id}` : null,
+    thumb: pickThumb(info),
     title: (info.title || "Video").slice(0, 200),
     uploader: info.uploader || info.channel || "",
     duration: info.duration || null,

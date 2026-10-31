@@ -1,7 +1,7 @@
 {
   "name": "video-downloader-bot",
-  "version": "1.0.0",
-  "description": "Telegram bot: YouTube & Instagram video/MP3 downloader (uz/ru/en)",
+  "version": "2.0.0",
+  "description": "Telegram bot: YouTube & Instagram video/MP3 downloader (uz/ru/en) + admin panel",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
