@@ -724,7 +724,8 @@ export function registerAdmin(bot, deps) {
         if (!m.document) return ctx.reply("❌ .json faylni hujjat (document) sifatida yuboring.");
         if (m.document.file_size > 20 * 1024 * 1024) return ctx.reply("❌ Fayl juda katta (20 MB gacha).");
         const f = await ctx.api.getFile(m.document.file_id);
-        const r = await fetch(`https://api.telegram.org/file/bot${bot.token}/${f.file_path}`);
+        const root = (process.env.BOT_API_URL || "https://api.telegram.org").replace(/\/$/, "");
+        const r = await fetch(`${root}/file/bot${bot.token}/${f.file_path}`);
         if (!r.ok) throw new Error("Faylni yuklab bo'lmadi");
         const n = S.importBackup(JSON.parse(await r.text()));
         return done(`✅ Tiklandi: ${nf(n)} foydalanuvchi.`);

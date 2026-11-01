@@ -3,8 +3,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-export const TG_LIMIT = 50 * 1024 * 1024; // Telegram Bot API fayl chegarasi
-const MAX_SIZE_ARG = "49M";
+// BOT_API_URL berilsa (o'zingizning local Bot API serveringiz) — 2 GB gacha, aks holda 50 MB
+export const LOCAL_API = !!process.env.BOT_API_URL;
+export const TG_LIMIT = (LOCAL_API ? 1900 : 50) * 1024 * 1024;
+export const LIMIT_LABEL = LOCAL_API ? "2 GB" : "50 MB";
+const MAX_SIZE_ARG = LOCAL_API ? "1900M" : "49M";
+const DL_TIMEOUT = (LOCAL_API ? 120 : 20) * 60 * 1000;
+export const TIERS = [144, 240, 360, 480, 720, 1080];
 
 export class TooBigError extends Error {}
 
@@ -72,62 +77,75 @@ function pickThumb(info) {
   );
 }
 
+// Formatni 144..1080 pog'onalaridan biriga bog'laymiz (vertikal videolarda ham to'g'ri: eng kichik tomon bo'yicha)
+function tierOf(f) {
+  const m = Math.min(f.width || Infinity, f.height || Infinity);
+  if (!Number.isFinite(m)) return null;
+  for (const t of TIERS) if (m <= t * 1.12) return t;
+  return null; // 1080p dan katta
+}
+
 export async function getInfo(url) {
   const { out } = await run([...commonArgs(), "-J", url], 90 * 1000);
   const json = JSON.parse(out);
   const info = json.entries?.[0] ?? json;
   const formats = info.formats || [];
+  const duration = info.duration || null;
 
-  const video = formats.filter(
-    (f) => f.vcodec && f.vcodec !== "none" && f.height
-  );
+  const est = (f) => sizeOf(f) || (f.tbr && duration ? Math.round(f.tbr * 125 * duration) : null);
+
+  const video = formats.filter((f) => f.vcodec && f.vcodec !== "none" && (f.height || f.width));
   const audio = formats.filter(
     (f) => f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none")
   );
-  const audioSize = audio.reduce((m, f) => Math.max(m, sizeOf(f) || 0), 0);
+  const m4a = audio.filter((f) => /^mp4a/.test(f.acodec));
+  const audioSize = (m4a.length ? m4a : audio).reduce((m, f) => Math.max(m, est(f) || 0), 0);
 
-  let heights = [...new Set(video.map((f) => f.height))]
-    .filter((h) => h >= 240 && h <= 1080)
-    .sort((a, b) => a - b);
-  if (!heights.length) {
-    heights = [...new Set(video.map((f) => f.height))].sort((a, b) => a - b);
+  // Har bir pog'ona uchun eng yaxshi format (avc1 afzal, so'ng bitreyt bo'yicha)
+  const byTier = new Map();
+  for (const f of video) {
+    const t = tierOf(f);
+    if (!t) continue;
+    const score = (/^(avc1|h264)/.test(f.vcodec) ? 1e6 : 0) + (f.tbr || 0);
+    const cur = byTier.get(t);
+    if (!cur || score > cur.score) byTier.set(t, { f, score });
   }
-  heights = heights.slice(-4);
 
   const options = [];
-  for (const h of heights) {
-    const cands = video.filter((f) => f.height === h);
-    const pick = cands.find((f) => f.vcodec.startsWith("avc1")) || cands[0];
-    let est = sizeOf(pick);
-    if (est && pick.acodec === "none") est += audioSize;
-    if (est && est > TG_LIMIT) continue; // Telegramga sig'maydi
-    options.push({
-      q: String(h),
-      label: `${h}p` + (est ? ` · ${Math.max(1, Math.round(est / 1048576))}MB` : ""),
-    });
+  for (const t of TIERS) {
+    const hit = byTier.get(t);
+    if (!hit) continue;
+    const f = hit.f;
+    const hasAudio = !!f.acodec && f.acodec !== "none";
+    let size = est(f);
+    if (size && !hasAudio) size += audioSize;
+    options.push({ q: String(t), fid: f.format_id, hasAudio, est: size || null });
   }
   // Format haqida ma'lumot bo'lmasa (ba'zi Instagram postlari)
-  if (!video.length) options.push({ q: "best", label: null });
+  if (!options.length) options.push({ q: "best", fid: null, hasAudio: true, est: null });
 
   return {
     key: info.id ? `${(info.extractor_key || "x").toLowerCase()}:${info.id}` : null,
     thumb: pickThumb(info),
     title: (info.title || "Video").slice(0, 200),
     uploader: info.uploader || info.channel || "",
-    duration: info.duration || null,
+    duration,
     options,
+    // MP3 128 kbit/s ≈ 16 000 bayt/soniya
+    mp3Est: duration ? Math.round(duration * 16000) : null,
   };
 }
 
-export async function download(url, q, dir) {
+export async function download(url, sel, dir) {
   const args = [...commonArgs()];
-  if (q === "mp3") {
+  if (sel.mp3) {
     args.push("-f", "ba/b", "-x", "--audio-format", "mp3", "--audio-quality", "128K");
   } else {
-    const fmt =
-      q === "best"
-        ? "b[ext=mp4]/bv*+ba/b"
-        : `bv*[height<=${q}][vcodec^=avc1]+ba[acodec^=mp4a]/bv*[height<=${q}]+ba/b[height<=${q}]/b`;
+    let fmt = "b[ext=mp4]/bv*+ba/b";
+    if (sel.fid) {
+      const id = sel.fid;
+      fmt = sel.hasAudio ? `${id}/b` : `${id}+ba[acodec^=mp4a]/${id}+ba/${id}/b`;
+    }
     args.push("-f", fmt, "--merge-output-format", "mp4", "--remux-video", "mp4");
   }
   args.push(
@@ -139,7 +157,7 @@ export async function download(url, q, dir) {
 
   let stderr = "";
   try {
-    ({ err: stderr } = await run(args));
+    ({ err: stderr } = await run(args, DL_TIMEOUT));
   } catch (e) {
     if (/larger than max-filesize/i.test(e.stderr || "")) throw new TooBigError();
     throw e;

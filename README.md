@@ -35,7 +35,7 @@ git push -u origin main
    - `COOKIES_B64` = (pastga qarang, tavsiya etiladi)
    - `ADMIN_ID` = o'zingizning Telegram ID'ingiz (**admin panel uchun shart**; botga `/id` yuborsangiz ID ni ko'rsatadi)
    - `DATA_DIR` = `/app/data`
-4. Deploy tugagach loglarda `@TopVideoSaveBot ishga tushdi` chiqadi.
+4. Deploy tugagach loglarda `@botnomi ishga tushdi` chiqadi.
 Bot long-polling bilan ishlaydi, port yoki domen kerak emas.
 5. **Volume ulang (muhim):** servis → **Settings → Volumes → Add Volume**, Mount path: `/app/data`.
    Aks holda har redeploy'da foydalanuvchilar bazasi, statistika va sozlamalar o'chib ketadi.
@@ -74,10 +74,9 @@ Cookie'lar vaqt o'tib eskiradi, ishlamay qolsa qayta eksport qiling.
 | `ADMIN_ID` | Admin(lar) Telegram ID'si, vergul bilan: `111,222` | bo'sh |
 | `DATA_DIR` | Baza saqlanadigan papka (`db.json`) | ./data |
 | `TZ_NAME` | Statistika kunlari uchun vaqt mintaqasi | Asia/Tashkent |
-| `AUTO_PROFILE` | `0` bo'lsa, bot nomi/tavsifi avtomatik o'rnatilmaydi | yoqilgan |
-| `PROFILE_MODE` | `multi` bo'lsa, profil uz/ru/en tillarida alohida; aks holda hamma tilga o'zbekcha | o'zbekcha |
 
 ## Cheklovlar
+- Telegram Bot API orqali fayl 50 MB gacha. Kattaroq videolar uchun pastroq sifat yoki MP3 taklif qilinadi.
 - Baza `DATA_DIR/db.json` da saqlanadi (eski `users.json` avtomatik ko'chiriladi). Volume ulang, aks holda redeploy'da o'chadi.
 - Faqat ochiq (public) kontent. Mualliflik huquqi va YouTube/Instagram shartlariga rioya qilish sizning javobgarligingizda.
 
@@ -115,3 +114,37 @@ statistikada «Ulashish orqali kelganlar» sifatida hisoblanadi.
 - Foydalanuvchi buyruqlari: `/help`, `/me` (shaxsiy statistika), `/share` (botni do'stlarga ulashish), `/id`.
 - Yuklashlar endi bir-birini kutdirmaydi (oldin bitta foydalanuvchi yuklayotganda hamma kutib qolardi).
 - Bot to'xtatilganda baza diskka yoziladi (redeploy xavfsiz).
+
+## Sifat ro'yxati va hajmlar
+
+Havola yuborilganda muqova bilan birga 144p–1080p gacha mavjud sifatlarning **taxminiy hajmi** va MP3 hajmi ko'rsatiladi.
+✅ — Telegram yubora oladi, ⚠️ — chegaradan katta (bosilsa yuklanmaydi, ogohlantirish chiqadi). Hajm `yt-dlp` bergan
+ma'lumotdan hisoblanadi, shuning uchun bir necha foiz farq qilishi mumkin.
+
+## Xatolarni adminga yuborish
+
+Yuklashda xato chiqsa, sababi (`yt-dlp` xabari) va tavsiya `ADMIN_ID` dagi adminga Telegramda yuboriladi
+(bir xil xato 10 daqiqada bir marta). Railway loglarida ham `[getInfo]` / `[download]` belgisi bilan chiqadi.
+
+### YouTube «Sign in to confirm you're not a bot» xatosi
+Railway kabi server IP'larini YouTube ko'pincha bloklaydi. Yechim — cookies:
+1. Alohida (asosiy bo'lmagan) Google akkauntida YouTube'ga kiring.
+2. Brauzerga «Get cookies.txt LOCALLY» kengaytmasini o'rnating, youtube.com da `cookies.txt` ni eksport qiling.
+3. Faylni base64 ga aylantiring. Windows PowerShell: `[Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))`
+4. Natijani Railway Variables'ga `COOKIES_B64` nomi bilan qo'ying va redeploy qiling.
+
+## 50 MB dan katta fayllar va uzun videolar (local Bot API)
+
+Telegram'ning oddiy Bot API'si bot orqali **50 MB** dan katta fayl yuborishga ruxsat bermaydi. Uzun (soatlab) videolar
+uchun o'zingizning **local Bot API serveringiz** kerak (chegara 2 GB). Bot `BOT_API_URL` berilsa, avtomatik shu rejimga o'tadi.
+
+1. https://my.telegram.org → *API development tools* → `api_id` va `api_hash` oling.
+2. Railway'da shu loyihaga yangi servis: **New → Docker Image** → `aiogram/telegram-bot-api:latest`.
+   Servis nomi: `telegram-bot-api`. Variables: `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_LOCAL=1`
+   (aniq o'zgaruvchi nomlarini image'ning hujjatidan tekshiring).
+3. Botni cloud serverdan **bir marta** chiqaring: brauzerda `https://api.telegram.org/bot<TOKEN>/logOut` oching.
+   Shundan so'ng taxminan 10 daqiqa botni oddiy serverga qaytarib bo'lmaydi.
+4. Bot servisiga o'zgaruvchi qo'shing: `BOT_API_URL=http://telegram-bot-api.railway.internal:8081`
+5. Redeploy. Loglarda `Local Bot API: ... (fayl chegarasi 2 GB)` chiqishi kerak.
+
+Eslatma: katta fayllar Railway'da ko'proq trafik, disk va vaqt sarflaydi (yuklash va yuborish daqiqalab ketadi).

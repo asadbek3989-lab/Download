@@ -5,12 +5,12 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { LANGS, CHOOSE_LANG, getT } from "./i18n.js";
 import * as S from "./store.js";
-import { getInfo, download, TooBigError, setupCookies } from "./ytdlp.js";
+import { getInfo, download, TooBigError, setupCookies, LOCAL_API, TG_LIMIT, LIMIT_LABEL } from "./ytdlp.js";
+import { esc } from "./format.js";
 import { registerAdmin } from "./admin.js";
 import {
   buildCaption, plainCaption, shareKb, startMessage, sendStored,
 } from "./messages.js";
-import { applyProfile, migrateUsername } from "./profile.js";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -19,12 +19,14 @@ if (!token) {
 }
 
 const MAX_PARALLEL = Number(process.env.MAX_PARALLEL || 2);
-const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 90);
+const MAX_DURATION_MIN = Number(process.env.MAX_DURATION_MIN || 300);
 
 process.on("unhandledRejection", (e) => console.error("unhandledRejection:", e?.message || e));
 
 setupCookies();
-const bot = new Bot(token);
+// BOT_API_URL berilsa — o'zingizning local Bot API serveringiz (2 GB gacha fayl yuborish uchun)
+const API_ROOT = (process.env.BOT_API_URL || "").replace(/\/$/, "");
+const bot = new Bot(token, API_ROOT ? { client: { apiRoot: API_ROOT, timeoutSeconds: 3600 } } : undefined);
 
 // ---------- yordamchilar ----------
 const ALLOWED_HOSTS = [/(^|\.)youtube\.com$/, /^youtu\.be$/, /(^|\.)instagram\.com$/];
@@ -277,6 +279,44 @@ bot.on("message:text", (ctx) => {
   handleLink(ctx).catch((e) => console.error("handleLink:", e.message));
 });
 
+// Xato sababini adminga yuboradi (bir xil xato 10 daqiqada bir marta)
+const errSeen = new Map();
+function reportError(where, e, url = "") {
+  const raw = String(e?.stderr || e?.message || e || "").trim();
+  const tail = raw.split("\n").filter(Boolean).slice(-4).join("\n").slice(-700);
+  console.error(`[${where}]`, tail);
+  const sig = tail.slice(-80);
+  if (Date.now() - (errSeen.get(sig) || 0) < 10 * 60 * 1000) return;
+  errSeen.set(sig, Date.now());
+  let hint = "";
+  if (/sign in to confirm|not a bot|confirm you.re not/i.test(raw))
+    hint = "💡 YouTube bot-tekshiruvi: server IP'si bloklangan. COOKIES_B64 (cookies.txt) yoki PROXY kerak.";
+  else if (/login required|rate-limit reached|empty media response|requiring login|restricted video/i.test(raw))
+    hint = "💡 Instagram kirishni talab qilyapti: COOKIES_B64 kerak.";
+  else if (/HTTP Error 429|Too Many Requests/i.test(raw))
+    hint = "💡 Juda ko'p so'rov (429): proxy yoki biroz kutish kerak.";
+  else if (/Requested format is not available/i.test(raw))
+    hint = "💡 Format topilmadi: yt-dlp eskirgan bo'lishi mumkin (qayta deploy qiling).";
+  else if (/timeout|timed out/i.test(raw)) hint = "💡 Vaqt tugadi: tarmoq sekin yoki fayl juda katta.";
+  else if (/ffmpeg|ffprobe/i.test(raw)) hint = "💡 ffmpeg bilan muammo.";
+  for (const id of S.OWNERS) {
+    bot.api
+      .sendMessage(
+        id,
+        `⚠️ <b>Xato</b> (${esc(where)})\n<pre>${esc(tail)}</pre>${hint ? `\n${hint}` : ""}${url ? `\n${esc(url.slice(0, 200))}` : ""}`,
+        { parse_mode: "HTML", link_preview_options: { is_disabled: true } }
+      )
+      .catch(() => {});
+  }
+}
+
+const fmtSize = (b) => {
+  if (!b) return "—";
+  const mb = b / 1048576;
+  if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`;
+  return `${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB`;
+};
+
 async function fetchThumb(url) {
   try {
     const r = await fetch(url, {
@@ -312,6 +352,29 @@ async function handleLink(ctx) {
       return edit(t.tooLong(maxMinutes()));
     }
 
+    // Tanlov ro'yxati: 144p ... 1080p + MP3 (hajmi bilan)
+    const rows = info.options.map((o) => ({
+      q: o.q,
+      label: o.q === "best" ? t.video : `${o.q}p`,
+      est: o.est,
+    }));
+    rows.push({ q: "mp3", label: "MP3", est: info.mp3Est });
+    const big = (r) => r.est && r.est > TG_LIMIT;
+    const showRows = rows.filter((r) => r.q !== "best");
+    let table = "";
+    if (showRows.length) {
+      const w = Math.max(...showRows.map((r) => r.label.length));
+      const sizes = showRows.map((r) => fmtSize(r.est));
+      const sw = Math.max(...sizes.map((x) => x.length));
+      table =
+        "<pre>" +
+        showRows
+          .map((r, i) => `${big(r) ? "⚠️" : "✅"} ${(r.label + ":").padEnd(w + 1)} ${sizes[i].padStart(sw)}`)
+          .join("\n") +
+        "</pre>";
+    }
+    const legend = rows.some(big) ? t.legendBig(LIMIT_LABEL) : "";
+
     const id = crypto.randomBytes(4).toString("hex");
     jobs.set(id, {
       url,
@@ -320,14 +383,29 @@ async function handleLink(ctx) {
       title: info.title,
       uploader: info.uploader,
       duration: info.duration,
+      opts: Object.fromEntries(
+        info.options.map((o) => [o.q, { fid: o.fid, hasAudio: o.hasAudio, est: o.est }]).concat([["mp3", { mp3: true, est: info.mp3Est }]])
+      ),
       ts: Date.now(),
     });
 
+    // Tugmalar: 3 tadan qator, pastida MP3
     const kb = new InlineKeyboard();
-    for (const o of info.options) kb.text(o.label || t.video, `dl:${id}:${o.q}`);
+    const vids = rows.filter((r) => r.q !== "mp3");
+    vids.forEach((r, i) => {
+      kb.text(r.q === "best" ? r.label : `🎬 ${r.label}`, `dl:${id}:${r.q}`);
+      if ((i + 1) % 3 === 0 && i + 1 < vids.length) kb.row();
+    });
     kb.row().text(t.audio, `dl:${id}:mp3`);
 
-    const text = t.choose(info.title, fmtDur(info.duration), (info.uploader || "").slice(0, 80));
+    const text = t.choose(
+      esc(info.title.slice(0, 150)),
+      fmtDur(info.duration),
+      esc((info.uploader || "").slice(0, 80)),
+      table,
+      legend
+    );
+    const extra = { caption: text.slice(0, 1024), parse_mode: "HTML", reply_markup: kb };
 
     // Videoning muqovasi bilan birga chiqaramiz
     if (info.thumb) {
@@ -337,7 +415,7 @@ async function handleLink(ctx) {
       attempts.push(info.thumb);
       for (const photo of attempts) {
         try {
-          await ctx.api.sendPhoto(ctx.chat.id, photo, { caption: text.slice(0, 1024), reply_markup: kb });
+          await ctx.api.sendPhoto(ctx.chat.id, photo, extra);
           await ctx.api.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
           return;
         } catch (e) {
@@ -345,10 +423,10 @@ async function handleLink(ctx) {
         }
       }
     }
-    await edit(text, { reply_markup: kb }); // muqova bo'lmasa — oddiy matn
+    await edit(text, { reply_markup: kb, parse_mode: "HTML" }); // muqova bo'lmasa — oddiy matn
   } catch (e) {
-    console.error("getInfo xato:", e.message);
     S.bump("err");
+    reportError("getInfo", e, url);
     await edit(t.failed);
   }
 }
@@ -362,6 +440,10 @@ bot.callbackQuery(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
   const job = jobs.get(id);
 
   if (!job) return ctx.answerCallbackQuery({ text: t.expired, show_alert: true });
+  const opt = job.opts?.[q];
+  if (!opt) return ctx.answerCallbackQuery({ text: t.expired, show_alert: true });
+  if (opt.est && opt.est > TG_LIMIT)
+    return ctx.answerCallbackQuery({ text: t.tooBig(LIMIT_LABEL), show_alert: true });
   if (active.has(uid)) return ctx.answerCallbackQuery({ text: t.busy, show_alert: true });
 
   const limit = S.settings.dailyLimit;
@@ -454,7 +536,7 @@ async function runDownload(ctx, job, q, lang, t) {
     await acquire();
     let res;
     try {
-      res = await download(job.url, q, dir);
+      res = await download(job.url, job.opts[q], dir);
     } finally {
       release();
     }
@@ -466,9 +548,10 @@ async function runDownload(ctx, job, q, lang, t) {
     S.recordDownload(uid, { platform: job.platform, kind, cached: false });
     await ctx.api.deleteMessage(chatId, msgId).catch(() => {});
   } catch (e) {
-    console.error("download xato:", e.message);
     S.bump("err");
-    await edit(e instanceof TooBigError ? t.tooBig : t.failed);
+    if (e instanceof TooBigError) console.error("download: fayl chegaradan katta");
+    else reportError("download", e, job.url);
+    await edit(e instanceof TooBigError ? t.tooBig(LIMIT_LABEL) : t.failed);
   } finally {
     fs.rm(dir, { recursive: true, force: true }, () => {});
   }
@@ -507,14 +590,9 @@ for (const id of S.OWNERS) {
 
 await refreshInline();
 setInterval(refreshInline, 5 * 60 * 1000).unref();
-
-// Bot username'i tokendan avtomatik olinadi; saqlangan matnlarda eski username qolgan bo'lsa tuzatiladi
-const botInfo = await bot.api.getMe().catch(() => null);
-if (botInfo) migrateUsername(botInfo.username);
-// Bot profili (nom, qisqa tavsif, tavsif): uz/ru/en. O'chirish: AUTO_PROFILE=0
-applyProfile(bot.api).catch((e) => console.warn("Profil xatosi:", e.message));
 if (!S.OWNERS.length)
   console.warn("ADMIN_ID berilmagan: admin panel ishlamaydi. Botga /id yuborib ID ingizni bilib oling.");
+console.log(LOCAL_API ? `Local Bot API: ${API_ROOT} (fayl chegarasi ${LIMIT_LABEL})` : "Cloud Bot API (fayl chegarasi 50 MB)");
 if (!inlineOn)
   console.warn("Inline rejim o'chiq: «Ulashish» faqat bot havolasini ulashadi. @BotFather → /setinline qiling.");
 
