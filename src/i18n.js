@@ -14,12 +14,12 @@ const T = {
       "ℹ️ Qanday foydalaniladi:\n\n1️⃣ YouTube yoki Instagram havolasini yuboring\n2️⃣ Sifatni (yoki MP3) tanlang\n3️⃣ Tayyor! Videoni do'stlaringizga «📤 Ulashish» tugmasi bilan yuboring\n\n/lang — tilni o'zgartirish\n/me — mening statistikam\n/share — botni do'stlarga ulashish",
     invalid: "❌ Havola tushunarsiz. YouTube yoki Instagram havolasini yuboring.",
     fetching: "🔎 Ma'lumot olinmoqda...",
-    choose: (title, dur, by, table, legend) =>
-      `🎬 <b>${title}</b>\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\n${table}${legend ? `\n${legend}` : ""}\n\nFormatni tanlang 👇`,
+    choose: (title, dur, by, table) =>
+      `🎬 <b>${title}</b>\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\n${table}\n\nFormatni tanlang 👇`,
     downloading: "⏳ Yuklab olinmoqda...",
     uploading: "📤 Telegramga yuborilmoqda...",
     tooBig: (lim) => `⚠️ Fayl Telegram chegarasidan (${lim}) katta. Pastroq sifatni yoki MP3 ni tanlang.`,
-    legendBig: (lim) => `⚠️ — ${lim} dan katta, Telegram orqali yuborib bo'lmaydi`,
+    tooBigAll: (lim) => `⚠️ Bu videoni yuborib bo'lmaydi: hatto eng kichik sifati ham Telegram chegarasidan (${lim}) katta.`,
     tooLong: (min) => `⚠️ Video juda uzun (maksimal ${min} daqiqa).`,
     failed:
       "❌ Yuklab bo'lmadi. Video yopiq bo'lishi yoki havola noto'g'ri bo'lishi mumkin. Keyinroq qayta urinib ko'ring.",
@@ -51,12 +51,12 @@ const T = {
       "ℹ️ Как пользоваться:\n\n1️⃣ Отправьте ссылку на YouTube или Instagram\n2️⃣ Выберите качество (или MP3)\n3️⃣ Готово! Отправьте видео друзьям кнопкой «📤 Поделиться»\n\n/lang — сменить язык\n/me — моя статистика\n/share — поделиться ботом",
     invalid: "❌ Ссылка не распознана. Отправьте ссылку на YouTube или Instagram.",
     fetching: "🔎 Получаю информацию...",
-    choose: (title, dur, by, table, legend) =>
-      `🎬 <b>${title}</b>\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\n${table}${legend ? `\n${legend}` : ""}\n\nВыберите формат 👇`,
+    choose: (title, dur, by, table) =>
+      `🎬 <b>${title}</b>\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\n${table}\n\nВыберите формат 👇`,
     downloading: "⏳ Скачиваю...",
     uploading: "📤 Отправляю в Telegram...",
     tooBig: (lim) => `⚠️ Файл больше лимита Telegram (${lim}). Выберите меньшее качество или MP3.`,
-    legendBig: (lim) => `⚠️ — больше ${lim}, Telegram не отправит`,
+    tooBigAll: (lim) => `⚠️ Это видео отправить нельзя: даже минимальное качество больше лимита Telegram (${lim}).`,
     tooLong: (min) => `⚠️ Видео слишком длинное (максимум ${min} мин).`,
     failed:
       "❌ Не удалось скачать. Видео может быть закрытым, или ссылка неверна. Попробуйте позже.",
@@ -88,12 +88,12 @@ const T = {
       "ℹ️ How to use:\n\n1️⃣ Send a YouTube or Instagram link\n2️⃣ Pick a quality (or MP3)\n3️⃣ Done! Send the video to friends with the «📤 Share» button\n\n/lang — change language\n/me — my stats\n/share — share the bot",
     invalid: "❌ Unrecognized link. Please send a YouTube or Instagram link.",
     fetching: "🔎 Getting info...",
-    choose: (title, dur, by, table, legend) =>
-      `🎬 <b>${title}</b>\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\n${table}${legend ? `\n${legend}` : ""}\n\nChoose a format 👇`,
+    choose: (title, dur, by, table) =>
+      `🎬 <b>${title}</b>\n${by ? `👤 ${by}\n` : ""}⏱ ${dur}\n\n${table}\n\nChoose a format 👇`,
     downloading: "⏳ Downloading...",
     uploading: "📤 Sending to Telegram...",
     tooBig: (lim) => `⚠️ The file exceeds Telegram's ${lim} limit. Pick a lower quality or MP3.`,
-    legendBig: (lim) => `⚠️ — over ${lim}, Telegram can't send it`,
+    tooBigAll: (lim) => `⚠️ This video can't be sent: even its smallest quality exceeds Telegram's ${lim} limit.`,
     tooLong: (min) => `⚠️ The video is too long (max ${min} minutes).`,
     failed:
       "❌ Download failed. The video may be private or the link is wrong. Please try again later.",

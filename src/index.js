@@ -7,6 +7,7 @@ import { LANGS, CHOOSE_LANG, getT } from "./i18n.js";
 import * as S from "./store.js";
 import { getInfo, download, TooBigError, setupCookies, LOCAL_API, TG_LIMIT, LIMIT_LABEL } from "./ytdlp.js";
 import { esc } from "./format.js";
+import { probe, faststart, makeThumb } from "./media.js";
 import { registerAdmin } from "./admin.js";
 import {
   buildCaption, plainCaption, shareKb, startMessage, sendStored,
@@ -352,28 +353,27 @@ async function handleLink(ctx) {
       return edit(t.tooLong(maxMinutes()));
     }
 
-    // Tanlov ro'yxati: 144p ... 1080p + MP3 (hajmi bilan)
-    const rows = info.options.map((o) => ({
-      q: o.q,
-      label: o.q === "best" ? t.video : `${o.q}p`,
-      est: o.est,
-    }));
-    rows.push({ q: "mp3", label: "MP3", est: info.mp3Est });
-    const big = (r) => r.est && r.est > TG_LIMIT;
+    // Tanlov ro'yxati: Telegram yubora oladigan sifatlar (144p ... 1080p) + MP3, hajmi bilan.
+    // Chegaradan katta sifatlar ro'yxatda ham, tugmalarda ham chiqmaydi.
+    const fits = (est) => !est || est <= TG_LIMIT;
+    const rows = info.options
+      .filter((o) => fits(o.est))
+      .map((o) => ({ q: o.q, label: o.q === "best" ? t.video : `${o.q}p`, est: o.est, exact: o.exact }));
+    if (fits(info.mp3Est)) rows.push({ q: "mp3", label: "MP3", est: info.mp3Est, exact: true });
+    if (!rows.length) return edit(t.tooBigAll(LIMIT_LABEL));
+
     const showRows = rows.filter((r) => r.q !== "best");
     let table = "";
     if (showRows.length) {
       const w = Math.max(...showRows.map((r) => r.label.length));
-      const sizes = showRows.map((r) => fmtSize(r.est));
+      // aniq o'lchanmagan hajm "~" bilan belgilanadi
+      const sizes = showRows.map((r) => (r.est ? (r.exact ? "" : "~") : "") + fmtSize(r.est));
       const sw = Math.max(...sizes.map((x) => x.length));
       table =
         "<pre>" +
-        showRows
-          .map((r, i) => `${big(r) ? "⚠️" : "✅"} ${(r.label + ":").padEnd(w + 1)} ${sizes[i].padStart(sw)}`)
-          .join("\n") +
+        showRows.map((r, i) => `✅ ${(r.label + ":").padEnd(w + 1)} ${sizes[i].padStart(sw)}`).join("\n") +
         "</pre>";
     }
-    const legend = rows.some(big) ? t.legendBig(LIMIT_LABEL) : "";
 
     const id = crypto.randomBytes(4).toString("hex");
     jobs.set(id, {
@@ -383,6 +383,7 @@ async function handleLink(ctx) {
       title: info.title,
       uploader: info.uploader,
       duration: info.duration,
+      thumb: info.thumb,
       opts: Object.fromEntries(
         info.options.map((o) => [o.q, { fid: o.fid, hasAudio: o.hasAudio, est: o.est }]).concat([["mp3", { mp3: true, est: info.mp3Est }]])
       ),
@@ -396,14 +397,13 @@ async function handleLink(ctx) {
       kb.text(r.q === "best" ? r.label : `🎬 ${r.label}`, `dl:${id}:${r.q}`);
       if ((i + 1) % 3 === 0 && i + 1 < vids.length) kb.row();
     });
-    kb.row().text(t.audio, `dl:${id}:mp3`);
+    if (rows.some((r) => r.q === "mp3")) kb.row().text(t.audio, `dl:${id}:mp3`);
 
     const text = t.choose(
       esc(info.title.slice(0, 150)),
       fmtDur(info.duration),
       esc((info.uploader || "").slice(0, 80)),
-      table,
-      legend
+      table
     );
     const extra = { caption: text.slice(0, 1024), parse_mode: "HTML", reply_markup: kb };
 
@@ -464,10 +464,10 @@ bot.callbackQuery(/^dl:([a-f0-9]+):(\w+)$/, async (ctx) => {
 });
 
 /** Videoni (yoki MP3 ni) caption + «Ulashish» tugmasi bilan yuboradi */
-async function sendMedia(api, chatId, kind, file, job, lang, t, uid, me) {
+async function sendMedia(api, chatId, kind, file, job, lang, t, uid, me, extra = {}) {
   const sid = S.newShareId();
   const reply_markup = shareKb(t, sid, inlineOn, me.username);
-  const send = (extra) =>
+  const send = (cap) =>
     kind === "mp3"
       ? api.sendAudio(chatId, file, {
           title: job.title.slice(0, 100),
@@ -475,12 +475,14 @@ async function sendMedia(api, chatId, kind, file, job, lang, t, uid, me) {
           duration: job.duration ? Math.round(job.duration) : undefined,
           reply_markup,
           ...extra,
+          ...cap,
         })
       : api.sendVideo(chatId, file, {
           supports_streaming: true,
           duration: job.duration ? Math.round(job.duration) : undefined,
           reply_markup,
           ...extra,
+          ...cap,
         });
 
   let msg;
@@ -543,7 +545,28 @@ async function runDownload(ctx, job, q, lang, t) {
 
     await edit(t.uploading);
     await ctx.api.sendChatAction(chatId, action).catch(() => {});
-    const sent = await sendMedia(ctx.api, chatId, kind, new InputFile(res.file), job, lang, t, uid, ctx.me);
+
+    // Videoning o'lchami + YouTube/Instagram muqovasi (Telegramda qora kvadrat chiqmasligi uchun)
+    const extra = {};
+    try {
+      if (kind === "video") {
+        await faststart(res.file);
+        const m = await probe(res.file);
+        if (m.width && m.height) { extra.width = m.width; extra.height = m.height; }
+        if (m.duration) extra.duration = m.duration;
+        const buf = job.thumb ? await fetchThumb(job.thumb) : null;
+        const ratio = m.width && m.height ? m.width / m.height : null;
+        const th = await makeThumb(dir, { buf, file: res.file, duration: m.duration || job.duration, ratio });
+        if (th) extra.thumbnail = new InputFile(th);
+      } else if (job.thumb) {
+        const buf = await fetchThumb(job.thumb);
+        const th = buf && (await makeThumb(dir, { buf, ratio: 1 }));
+        if (th) extra.thumbnail = new InputFile(th);
+      }
+    } catch (e) {
+      console.error("media tayyorlash:", e.message);
+    }
+    const sent = await sendMedia(ctx.api, chatId, kind, new InputFile(res.file), job, lang, t, uid, ctx.me, extra);
     if (cacheKey && sent.fid) S.setCache(cacheKey, { f: sent.fid, t: sent.type });
     S.recordDownload(uid, { platform: job.platform, kind, cached: false });
     await ctx.api.deleteMessage(chatId, msgId).catch(() => {});

@@ -94,6 +94,7 @@ Cookie'lar vaqt o'tib eskiradi, ishlamay qolsa qayta eksport qiling.
 | 👤 Foydalanuvchilar | ID yoki @username bo'yicha topish, ban/unban, shaxsiy xabar yuborish |
 | ⚙️ Sozlamalar | Texnik ishlar rejimi, kunlik limit, maksimal video uzunligi, avto-backup, inline rejim holati |
 | 💾 Backup | Bazani JSON fayl qilib olish va tiklash. Avto-backup har 12 soatda asosiy adminga keladi |
+| 🤖 Bot profili | Bot nomi, qisqa matn (About) va tavsifni shu yerdan yozish. Matn hamma tillarda bir xil bo'ladi, tilga xos (tarjima) variantlar o'chiriladi |
 | 👮 Adminlar | Qo'shimcha adminlar qo'shish/o'chirish (faqat `ADMIN_ID` dagilar) |
 
 ## «Ulashish» tugmasi (muhim sozlama)
@@ -117,9 +118,15 @@ statistikada «Ulashish orqali kelganlar» sifatida hisoblanadi.
 
 ## Sifat ro'yxati va hajmlar
 
-Havola yuborilganda muqova bilan birga 144p–1080p gacha mavjud sifatlarning **taxminiy hajmi** va MP3 hajmi ko'rsatiladi.
-✅ — Telegram yubora oladi, ⚠️ — chegaradan katta (bosilsa yuklanmaydi, ogohlantirish chiqadi). Hajm `yt-dlp` bergan
-ma'lumotdan hisoblanadi, shuning uchun bir necha foiz farq qilishi mumkin.
+Havola yuborilganda muqova bilan birga 144p–1080p gacha mavjud sifatlarning **hajmi** va MP3 hajmi ko'rsatiladi.
+Telegram yubora olmaydigan (chegaradan katta) sifatlar na ro'yxatda, na tugmalarda chiqmaydi.
+Hajm avval `yt-dlp` ma'lumotidan, u bo'lmasa to'g'ridan-to'g'ri YouTube serveridan so'rab olinadi (aniq).
+Faqat taxmin qilingan hajm `~` belgisi bilan yoziladi.
+
+## Video muqovasi
+
+Yuborilgan videoga YouTube/Instagram muqovasi qo'yiladi (yo'q bo'lsa — videoning o'z kadri), shuningdek
+videoning eni/bo'yi/davomiyligi va `faststart` beriladi, shunda Telegramda qora kvadrat chiqmaydi.
 
 ## Xatolarni adminga yuborish
 

@@ -85,6 +85,24 @@ function tierOf(f) {
   return null; // 1080p dan katta
 }
 
+// Format faylining haqiqiy hajmi: Range so'rovi bilan serverdan olinadi (yt-dlp bermagan bo'lsa)
+async function remoteSize(f) {
+  if (!f.url || !/^https?:/i.test(f.url) || /m3u8|dash|manifest/i.test(f.protocol || "")) return null;
+  try {
+    const r = await fetch(f.url, {
+      headers: { ...(f.http_headers || {}), Range: "bytes=0-0" },
+      signal: AbortSignal.timeout(6000),
+    });
+    const total = r.headers.get("content-range")?.match(/\/(\d+)$/)?.[1];
+    const len = Number(r.headers.get("content-length"));
+    await r.body?.cancel().catch(() => {});
+    if (total) return Number(total);
+    return r.status === 200 && len > 1 ? len : null; // server Range'ni e'tiborsiz qoldirsa — to'liq uzunlik
+  } catch {
+    return null;
+  }
+}
+
 export async function getInfo(url) {
   const { out } = await run([...commonArgs(), "-J", url], 90 * 1000);
   const json = JSON.parse(out);
@@ -92,14 +110,24 @@ export async function getInfo(url) {
   const formats = info.formats || [];
   const duration = info.duration || null;
 
-  const est = (f) => sizeOf(f) || (f.tbr && duration ? Math.round(f.tbr * 125 * duration) : null);
+  // {s: bayt, exact: aniq o'lchanganmi}
+  const sizeInfo = async (f) => {
+    if (f.filesize) return { s: f.filesize, exact: true };
+    const r = await remoteSize(f);
+    if (r) return { s: r, exact: true };
+    const approx = f.filesize_approx || (f.tbr && duration ? Math.round(f.tbr * 125 * duration) : null);
+    return { s: approx, exact: false };
+  };
 
   const video = formats.filter((f) => f.vcodec && f.vcodec !== "none" && (f.height || f.width));
   const audio = formats.filter(
     (f) => f.acodec && f.acodec !== "none" && (!f.vcodec || f.vcodec === "none")
   );
-  const m4a = audio.filter((f) => /^mp4a/.test(f.acodec));
-  const audioSize = (m4a.length ? m4a : audio).reduce((m, f) => Math.max(m, est(f) || 0), 0);
+  // yuklashda `ba[acodec^=mp4a]` tanlanadi: eng yaxshi m4a (bo'lmasa istalgan audio)
+  const audPool = audio.filter((f) => /^mp4a/.test(f.acodec));
+  const audioFmt = (audPool.length ? audPool : audio).sort(
+    (a, b) => (b.abr || b.tbr || 0) - (a.abr || a.tbr || 0)
+  )[0];
 
   // Har bir pog'ona uchun eng yaxshi format (avc1 afzal, so'ng bitreyt bo'yicha)
   const byTier = new Map();
@@ -110,19 +138,27 @@ export async function getInfo(url) {
     const cur = byTier.get(t);
     if (!cur || score > cur.score) byTier.set(t, { f, score });
   }
+  const tiers = TIERS.filter((t) => byTier.has(t));
 
-  const options = [];
-  for (const t of TIERS) {
-    const hit = byTier.get(t);
-    if (!hit) continue;
-    const f = hit.f;
+  const [aud, ...vids] = await Promise.all([
+    audioFmt ? sizeInfo(audioFmt) : Promise.resolve({ s: 0, exact: true }),
+    ...tiers.map((t) => sizeInfo(byTier.get(t).f)),
+  ]);
+
+  const options = tiers.map((t, i) => {
+    const f = byTier.get(t).f;
     const hasAudio = !!f.acodec && f.acodec !== "none";
-    let size = est(f);
-    if (size && !hasAudio) size += audioSize;
-    options.push({ q: String(t), fid: f.format_id, hasAudio, est: size || null });
-  }
+    const v = vids[i];
+    let est = v.s || null;
+    let exact = v.exact;
+    if (est && !hasAudio) {
+      est = Math.round((est + (aud.s || 0)) * 1.01); // birlashtirish (mp4 konteyner) ~1%
+      exact = exact && aud.exact;
+    }
+    return { q: String(t), fid: f.format_id, hasAudio, est, exact };
+  });
   // Format haqida ma'lumot bo'lmasa (ba'zi Instagram postlari)
-  if (!options.length) options.push({ q: "best", fid: null, hasAudio: true, est: null });
+  if (!options.length) options.push({ q: "best", fid: null, hasAudio: true, est: null, exact: false });
 
   return {
     key: info.id ? `${(info.extractor_key || "x").toLowerCase()}:${info.id}` : null,

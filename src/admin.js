@@ -59,7 +59,7 @@ export function registerAdmin(bot, deps) {
       .text("👋 Start xabari", "a:start").text("🏷 Video reklamasi", "a:promo").row()
       .text("📣 Majburiy obuna", "a:sub").text("👤 Foydalanuvchilar", "a:usr").row()
       .text("⚙️ Sozlamalar", "a:set").text("💾 Backup", "a:bk").row()
-      .text("👮 Adminlar", "a:adm");
+      .text("👮 Adminlar", "a:adm").text("🤖 Bot profili", "a:prof");
 
   const home = (ctx) => show(ctx, "🛠 <b>Admin panel</b>\n\nKerakli bo'limni tanlang:", homeKb());
 
@@ -344,6 +344,58 @@ export function registerAdmin(bot, deps) {
   }, 12 * 60 * 60 * 1000);
   autoTimer.unref();
 
+  // ---------- BOT PROFILI (nom / about / tavsif) ----------
+  // Telegram foydalanuvchining tiliga qarab alohida (tarjima qilingan) nom/tavsifni ko'rsatishi mumkin.
+  // Quyida bitta matn hamma uchun qo'yiladi va tillarga xos variantlar o'chiriladi.
+  const LANG_CODES =
+    "en ru uz uk kk ky tg tk az tr ar fa hi id ms es pt fr de it nl pl ro cs sk hu bg sr hr sl el he ja ko zh vi th bn ur sv da fi no ka hy".split(" ");
+  const PROF = {
+    name: { get: "getMyName", set: "setMyName", field: "name", title: "Nom", max: 64 },
+    about: { get: "getMyShortDescription", set: "setMyShortDescription", field: "short_description", title: "Qisqa matn (About)", max: 120 },
+    desc: { get: "getMyDescription", set: "setMyDescription", field: "description", title: "Tavsif (Description)", max: 512 },
+  };
+
+  async function profGet(api, kind, language_code) {
+    const c = PROF[kind];
+    const r = await api.raw[c.get](language_code ? { language_code } : {});
+    return r?.[c.field] || "";
+  }
+
+  /** Boshqa tillar uchun alohida yozilgan variantlarni o'chiradi (shunda hamma asosiy matnni ko'radi) */
+  async function profClear(api, kind, target) {
+    const c = PROF[kind];
+    const cleared = [];
+    for (let i = 0; i < LANG_CODES.length; i += 8) {
+      await Promise.all(
+        LANG_CODES.slice(i, i + 8).map(async (code) => {
+          try {
+            const v = await profGet(api, kind, code);
+            if (v && v !== target) {
+              await api.raw[c.set]({ [c.field]: "", language_code: code });
+              cleared.push(code);
+            }
+          } catch {}
+        })
+      );
+    }
+    return cleared;
+  }
+
+  async function showProfile(ctx) {
+    const L = ["🤖 <b>Bot profili</b>", "", "Bu yerda yozilgan matn <b>hamma foydalanuvchiga bir xil</b> ko'rinadi (tilga qarab o'zgarmaydi).", ""];
+    for (const k of Object.keys(PROF)) {
+      let v = "";
+      try { v = await profGet(ctx.api, k); } catch {}
+      L.push(`<b>${PROF[k].title}</b> (${PROF[k].max} belgigacha):\n${v ? esc(v) : "<i>yozilmagan</i>"}`, "");
+    }
+    const kb = new InlineKeyboard()
+      .text("✏️ Nom", "bp:name").text("✏️ About", "bp:about").row()
+      .text("✏️ Tavsif", "bp:desc").row()
+      .text("🧹 Tillarga xos variantlarni o'chirish", "bp:sync").row()
+      .text("🔙 Orqaga", "a:home");
+    await show(ctx, L.join("\n"), kb);
+  }
+
   // ---------- ADMINLAR ----------
   async function showAdmins(ctx) {
     const L = ["👮 <b>Adminlar</b>", ""];
@@ -361,7 +413,7 @@ export function registerAdmin(bot, deps) {
   // =====================================================================
   //                         CALLBACK ROUTER
   // =====================================================================
-  bot.callbackQuery(/^(a|bc|st|pr|sb|us|se|bk|ad):/, async (ctx) => {
+  bot.callbackQuery(/^(a|bc|st|pr|sb|us|se|bk|ad|bp):/, async (ctx) => {
     const uid = ctx.from.id;
     if (!S.isAdmin(uid)) return ctx.answerCallbackQuery({ text: "⛔️" });
     await ctx.answerCallbackQuery().catch(() => {});
@@ -389,6 +441,7 @@ export function registerAdmin(bot, deps) {
           case "usr": return showUsers(ctx);
           case "set": return showSettings(ctx);
           case "adm": return showAdmins(ctx);
+          case "prof": return showProfile(ctx);
           case "bk":
             return show(
               ctx,
@@ -516,6 +569,25 @@ export function registerAdmin(bot, deps) {
         if (act === "get") return sendBackup(ctx.api, ctx.chat.id).catch((e) => ctx.reply("❌ " + esc(e.message)));
         if (act === "put")
           return ask("bk_wait", "📤 Backup <b>.json</b> faylini yuboring.\n\n⚠️ Joriy ma'lumotlar to'liq almashtiriladi!");
+      }
+
+      // ----- bot profili -----
+      if (ns === "bp") {
+        if (PROF[act])
+          return ask(
+            "bp_set",
+            `✏️ <b>${PROF[act].title}</b> uchun yangi matnni yuboring (${PROF[act].max} belgigacha, oddiy matn).\n\nBu matn hamma tillarda bir xil bo'ladi.`,
+            { kind: act }
+          );
+        if (act === "sync") {
+          const L = ["🧹 <b>Natija</b>", ""];
+          for (const k of Object.keys(PROF)) {
+            const target = await profGet(ctx.api, k);
+            const cleared = target ? await profClear(ctx.api, k, target) : [];
+            L.push(`${PROF[k].title}: ${cleared.length ? `o'chirildi — ${cleared.join(", ")}` : "tillarga xos variant yo'q"}`);
+          }
+          return show(ctx, L.join("\n"), back("a:prof"));
+        }
       }
 
       // ----- adminlar -----
@@ -729,6 +801,28 @@ export function registerAdmin(bot, deps) {
         if (!r.ok) throw new Error("Faylni yuklab bo'lmadi");
         const n = S.importBackup(JSON.parse(await r.text()));
         return done(`✅ Tiklandi: ${nf(n)} foydalanuvchi.`);
+      }
+
+      // --- bot profili ---
+      case "bp_set": {
+        const c = PROF[st.kind];
+        const v = (m.text || "").trim();
+        if (!v) return ctx.reply("❌ Matn yuboring.");
+        if (v.length > c.max) return ctx.reply(`❌ Juda uzun: ${v.length} / ${c.max} belgi.`);
+        try {
+          await ctx.api.raw[c.set]({ [c.field]: v });
+        } catch (e) {
+          return ctx.reply("❌ Telegram qabul qilmadi: " + esc(e.description || e.message));
+        }
+        const cleared = await profClear(ctx.api, st.kind, v);
+        states.delete(uid);
+        await ctx.reply(
+          `✅ ${c.title} saqlandi.` +
+            (cleared.length ? `\n🧹 Tillarga xos eski variantlar o'chirildi: ${cleared.join(", ")}` : "") +
+            "\n\n<i>Telegram ilovalarida yangilanish bir necha daqiqa olishi mumkin.</i>",
+          { parse_mode: "HTML" }
+        );
+        return showProfile(ctx);
       }
 
       // --- admin qo'shish ---
